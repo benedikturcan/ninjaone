@@ -1,0 +1,6 @@
+# Local cache of the last successful console API query (child-policy overrides)
+.child-policy-overrides-cache.json
+
+# Generated reports
+policies.html
+policy-orgchart.html

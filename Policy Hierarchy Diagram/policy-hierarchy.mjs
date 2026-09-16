@@ -1,8 +1,9 @@
 // Credentials are read from environment variables so they never end up in the repository:
 //   NINJA_REGION         e.g. 'eu' (default), 'app', 'ca', 'oc'
-//   NINJA_CLIENT_ID      OAuth client ID (client_credentials, scope: monitoring)
+//   NINJA_CLIENT_ID      OAuth client ID (client_credentials, scopes: monitoring + management)
 //   NINJA_CLIENT_SECRET  OAuth client secret
-//   NINJA_SESSION_KEY    sessionKey cookie of a logged-in web session (used for /swb/s4/policy)
+//   NINJA_SESSION_KEY    sessionKey cookie of a logged-in NinjaOne web session (console API /swb/...).
+//                        It rotates, so it can also be passed as first argument: node policy-hierarchy.mjs <sessionKey>
 const baseUrl = process.env.NINJA_REGION || 'eu';
 const clientId = process.env.NINJA_CLIENT_ID;
 const clientSecret = process.env.NINJA_CLIENT_SECRET;
@@ -34,7 +35,7 @@ async function fetchToken(scope = 'monitoring management') {
   return data.access_token;
 }
 
-const sessionKey = process.env.NINJA_SESSION_KEY;
+const sessionKey = process.argv[2] || process.env.NINJA_SESSION_KEY;
 
 let cachedToken = null;
 
@@ -74,8 +75,9 @@ async function updateGlobalCustomField(fieldName, html) {
   }
 }
 
-async function fetchWithSession(policyId) {
-  const response = await fetch(`${apiUrl}/swb/s4/policy/${policyId}`, {
+// Private NinjaOne console API, authenticated with the browser sessionKey cookie
+async function fetchWithSession(endpoint) {
+  const response = await fetch(`${apiUrl}${endpoint}`, {
     method: 'GET',
     headers: {
       'Accept': 'application/json',
@@ -85,7 +87,11 @@ async function fetchWithSession(policyId) {
   });
 
   if (!response.ok) {
-    throw new Error(`Session API failed: /swb/s4/policy/${policyId} ${response.status} ${response.statusText}`);
+    throw new Error(`Session API failed: ${endpoint} ${response.status} ${response.statusText}`);
+  }
+  // An expired session answers with the login page instead of JSON
+  if (!(response.headers.get('content-type') || '').includes('application/json')) {
+    throw new Error(`Session API returned no JSON: ${endpoint} (sessionKey expired?)`);
   }
 
   return response.json();
@@ -97,31 +103,46 @@ function resolveName(key, value) {
   return key;
 }
 
-function extractOverrides(content, path = '') {
+// Field-level differences between a child block and the same block of the parent.
+// Nested blocks carrying their own inheritance flags are skipped here, they are reported as separate overrides.
+function diffValues(child, parent, path = '') {
+  const isObject = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+  if (isObject(child) && isObject(parent)) {
+    const changes = [];
+    for (const key of new Set([...Object.keys(child), ...Object.keys(parent)])) {
+      if (key === 'inheritance' || child[key]?.inheritance || parent[key]?.inheritance) continue;
+      changes.push(...diffValues(child[key], parent[key], path ? `${path}.${key}` : key));
+    }
+    return changes;
+  }
+  return JSON.stringify(child) === JSON.stringify(parent) ? [] : [{ field: path, parentValue: parent, childValue: child }];
+}
+
+// Walks the child policy content (/swb/s4/policy/{id}) alongside the parent content
+// (/swb/s6/policy/{id}/parent-content). Every block flagged as overridden or added in the child
+// becomes one entry with its concrete field changes.
+function extractOverrides(content, parentContent, path = '') {
   const overrides = [];
 
-  for (const [key, value] of Object.entries(content)) {
-    const label = (value && typeof value === 'object') ? resolveName(key, value) : key;
+  for (const [key, value] of Object.entries(content || {})) {
+    if (key === 'inheritance' || !value || typeof value !== 'object' || Array.isArray(value)) continue;
+    const label = resolveName(key, value);
     const currentPath = path ? `${path} › ${label}` : label;
+    const parentValue = parentContent?.[key];
+    const inh = value.inheritance;
 
-    if (value && typeof value === 'object') {
-      if (value.inheritance) {
-        const inh = value.inheritance;
-        if (inh.overridden === true || inh.inherited === false) {
-          overrides.push({
-            section: currentPath,
-            overridden: inh.overridden,
-            inherited: inh.inherited,
-            sourcePolicyId: inh.sourcePolicyId,
-          });
-        }
-      }
-
-      if (!value.inheritance || typeof value === 'object') {
-        const nested = extractOverrides(value, currentPath);
-        overrides.push(...nested);
-      }
+    if (inh && (inh.overridden === true || inh.inherited === false)) {
+      overrides.push({
+        section: currentPath,
+        overridden: inh.overridden,
+        inherited: inh.inherited,
+        sourcePolicyId: inh.sourcePolicyId,
+        addedInChild: parentValue === undefined,
+        changes: parentValue === undefined ? [] : diffValues(value, parentValue),
+      });
     }
+
+    overrides.push(...extractOverrides(value, parentValue, currentPath));
   }
 
   return overrides;
@@ -136,8 +157,11 @@ async function fetchChildPolicyOverrides(childPolicies) {
     const batchResults = await Promise.all(
       batch.map(async (policy) => {
         try {
-          const data = await fetchWithSession(policy.id);
-          const overrides = extractOverrides(data.policy.content);
+          const [data, parentContent] = await Promise.all([
+            fetchWithSession(`/swb/s4/policy/${policy.id}`),
+            fetchWithSession(`/swb/s6/policy/${policy.id}/parent-content`),
+          ]);
+          const overrides = extractOverrides(data.policy.content, parentContent);
           const uniqueSections = [...new Set(overrides.map(o => o.section.split(' › ')[0]))];
           return {
             policyId: policy.id,
@@ -1105,7 +1129,8 @@ function nodeClassIcon(nodeClass) {
   return nodeClassInfo[nodeClass]?.[1] || (String(nodeClass).startsWith('NMS') ? 'fa-solid fa-ethernet' : 'fa-solid fa-circle-nodes');
 }
 
-function generateCustomFieldHTML(policies, tree, overrideDetails = [], childPolicyOverrides = [], policyMap = new Map()) {
+// childOverridesStatus: { source: 'live' | 'cache' | 'unavailable', fetchedAt, reason }
+function generateCustomFieldHTML(policies, tree, overrideDetails = [], childPolicyOverrides = [], policyMap = new Map(), childOverridesStatus = { source: 'live' }) {
   const lineColor = '#94a3b8';
   const mutedColor = '#94a3b8';
   const depthColors = ['#6366f1', '#0891b2', '#7c3aed'];
@@ -1136,11 +1161,14 @@ function generateCustomFieldHTML(policies, tree, overrideDetails = [], childPoli
   const failedChildLoads = childPolicyOverrides.filter(c => c.error).length;
 
   // Policy node: fixed single-line card so the connector (height 19px + card margin 6px) meets its vertical center
+  // Every changed field counts; an overridden block without value differences still counts once
+  const changedSettingCount = childOverride => childOverride.overrides.reduce((sum, o) => sum + Math.max(o.changes.length, 1), 0);
+
   const policyTags = (policy) => {
     const childOverride = childOverrideByPolicy.get(policy.id);
     const deviceOverrides = deviceOverridesByPolicy.get(policy.id);
     return (policy.nodeClassDefault ? tag('Default', 'success') : '')
-      + (childOverride ? tag(`${childOverride.overriddenSections.length} section${childOverride.overriddenSections.length > 1 ? 's' : ''} overridden`, 'danger') : '')
+      + (childOverride ? tag(`${changedSettingCount(childOverride)} changed setting${changedSettingCount(childOverride) === 1 ? '' : 's'}`, 'danger') : '')
       + (deviceOverrides ? tag(`${deviceOverrides} device override${deviceOverrides > 1 ? 's' : ''}`, 'neutral') : '');
   };
 
@@ -1261,7 +1289,11 @@ function generateCustomFieldHTML(policies, tree, overrideDetails = [], childPoli
   const statCard = (value, label) => `<div class="col"><div class="stat-card"><div class="stat-value">${value}</div><div class="stat-desc">${label}</div></div></div>`;
   const inheritanceChains = tree.filter(r => r.children.length > 0).length;
   const maxDepth = tree.length > 0 ? Math.max(...tree.map(depthOf)) : 0;
-  const childOverrideStat = failedChildLoads > 0 && failedChildLoads === childPolicyOverrides.length ? 'n/a' : childWithOverrides.length;
+  const childOverrideStat = childOverridesStatus.source === 'unavailable' ? 'n/a' : childWithOverrides.length;
+  const childDataDate = childOverridesStatus.fetchedAt ? new Date(childOverridesStatus.fetchedAt).toLocaleString('de-DE') : null;
+  const childOverrideStatLabel = childOverridesStatus.source === 'cache'
+    ? `Child policies with overrides (as of ${escapeHtml(childDataDate)})`
+    : 'Child policies with overrides';
 
   const legend = `<div style="font-size:12px;color:${mutedColor};margin:0 0 12px;">Read left to right: arrows point from a policy to the policies that inherit from it.</div>`;
 
@@ -1278,35 +1310,85 @@ function generateCustomFieldHTML(policies, tree, overrideDetails = [], childPoli
       + `</tbody></table>`
     : infoCard('success', 'fa-circle-check', 'No device overrides', 'All devices follow their assigned policy.');
 
-  let childSection;
-  if (failedChildLoads > 0) {
-    childSection = infoCard('warning', 'fa-triangle-exclamation', 'Child-policy overrides incomplete',
-      `Could not load ${failedChildLoads} of ${childPolicyOverrides.length} child policies. The browser session key has probably expired.`);
-  } else {
-    childSection = '';
+  // Child-policy overrides: one block per child policy with a Parent → Child value table
+  const areaLabels = {
+    conditions: 'Conditions',
+    builtInConditions: 'Built-in conditions',
+    actionsetSchedules: 'Scheduled automations',
+    patchManagement: 'OS patch management',
+    softwarePatchManagement: 'Software patch management',
+    antivirus: 'Antivirus',
+    monitors: 'Monitors',
+    backup: 'Backup',
+    warrantyTracking: 'Warranty tracking',
+    mdmSettings: 'MDM settings',
+    browserManagement: 'Browser management',
+    ringDeployment: 'Ring deployment',
+    ninjaFlow: 'NinjaFlow',
+  };
+  // camelCase keys become words, labels that are already names (conditions, schedules) stay as they are
+  const prettyKey = key => /^[a-z][a-zA-Z0-9]*$/.test(key)
+    ? key.replace(/([a-z0-9])([A-Z])/g, '$1 $2').toLowerCase().replace(/^./, c => c.toUpperCase())
+    : key;
+  const formatValue = (value, colors) => {
+    if (value === undefined) return `<span style="font-size:12px;color:${mutedColor};">not set</span>`;
+    const raw = typeof value === 'string' ? value : JSON.stringify(value);
+    const text = raw.length > 160 ? `${raw.slice(0, 157)}...` : raw;
+    return `<span style="display:inline-block;padding:1px 6px;border-radius:4px;font-size:12px;font-family:monospace;word-break:break-word;background-color:${colors[0]};color:${colors[1]};">${escapeHtml(text)}</span>`;
+  };
+  const cell = 'padding:6px 8px;vertical-align:top;';
+
+  const renderChildOverrides = c => {
+    const parent = policyMap.get(c.parentPolicyId);
+    const rows = c.overrides.flatMap(o => {
+      const [area, ...item] = o.section.split(' › ');
+      const areaCell = `<td style="${cell}font-size:12px;">${escapeHtml(areaLabels[area] || prettyKey(area))}</td>`;
+      const itemLabel = item.length > 0 ? item.map(prettyKey).map(escapeHtml).join(' › ') : escapeHtml(areaLabels[area] || prettyKey(area));
+      if (o.changes.length === 0) {
+        const note = o.addedInChild ? 'Added in child policy (not present in parent)' : 'Marked as overridden, values identical to parent';
+        return [`<tr>${areaCell}<td style="${cell}font-size:13px;">${itemLabel}</td><td style="${cell}" colspan="2"><span style="font-size:12px;color:${mutedColor};">${note}</span></td></tr>`];
+      }
+      return o.changes.map(change => `<tr>${areaCell}`
+        + `<td style="${cell}"><div style="font-size:13px;">${itemLabel}</div>`
+        + (change.field ? `<div style="font-size:11px;color:${mutedColor};font-family:monospace;">${escapeHtml(change.field.split('.').map(prettyKey).join(' › '))}</div>` : '')
+        + `</td>`
+        + `<td style="${cell}">${formatValue(change.parentValue, chipColors.danger)}</td>`
+        + `<td style="${cell}">${formatValue(change.childValue, chipColors.success)}</td>`
+        + `</tr>`);
+    });
+    const settingCount = changedSettingCount(c);
+
+    return `<div style="margin-bottom:16px;">`
+      + `<div style="display:flex;align-items:center;padding:6px 10px;border-radius:6px;background-color:#f1f5f9;">`
+      + `<span style="font-size:14px;">${policyLink(c.policyId, c.policyName)}</span>`
+      + `<span style="font-size:12px;color:${mutedColor};margin:0 6px 0 10px;">inherits from</span>`
+      + `<span style="font-size:12px;">${parent ? policyLink(parent.id, parent.name) : '–'}</span>`
+      + chip(`${settingCount} changed setting${settingCount === 1 ? '' : 's'}`, 'danger', '0 0 0 10px')
+      + `</div>`
+      + `<table style="width:100%;border-collapse:collapse;margin-top:4px;"><thead><tr>`
+      + `<th style="text-align:left;padding:6px 8px;width:16%;">Area</th>`
+      + `<th style="text-align:left;padding:6px 8px;width:34%;">Setting</th>`
+      + `<th style="text-align:left;padding:6px 8px;width:25%;">Parent value</th>`
+      + `<th style="text-align:left;padding:6px 8px;width:25%;">Child value</th>`
+      + `</tr></thead><tbody>${rows.join('')}</tbody></table>`
+      + `</div>`;
+  };
+
+  let childSection = '';
+  if (childOverridesStatus.source === 'cache') {
+    childSection += infoCard('warning', 'fa-clock-rotate-left', `Child-policy overrides as of ${escapeHtml(childDataDate)}`,
+      `${escapeHtml(childOverridesStatus.reason)} Showing the data of the last run with a valid sessionKey.`);
+  } else if (childOverridesStatus.source === 'unavailable') {
+    childSection += infoCard('warning', 'fa-triangle-exclamation', 'Child-policy overrides unavailable',
+      `${escapeHtml(childOverridesStatus.reason)} No earlier data found: run the script once with a valid sessionKey.`);
+  } else if (failedChildLoads > 0) {
+    childSection += infoCard('warning', 'fa-triangle-exclamation', 'Child-policy overrides incomplete',
+      `Could not load ${failedChildLoads} of ${childPolicyOverrides.length} child policies from the NinjaOne console API.`);
   }
   if (childWithOverrides.length > 0) {
-    childSection += `<table style="width:100%;border-collapse:collapse;"><thead><tr><th style="text-align:left;padding:6px 8px;">Child policy</th><th style="text-align:left;padding:6px 8px;">Inherits from</th><th style="text-align:left;padding:6px 8px;">Overridden sections</th></tr></thead><tbody>`
-      + [...childWithOverrides].sort((a, b) => a.policyName.localeCompare(b.policyName)).map(c => {
-        const parent = policyMap.get(c.parentPolicyId);
-        const grouped = {};
-        c.overrides.forEach(o => {
-          const parts = o.section.split(' › ');
-          if (!grouped[parts[0]]) grouped[parts[0]] = [];
-          if (parts.length > 1) grouped[parts[0]].push(parts.slice(1).join(' › '));
-        });
-        const sections = Object.entries(grouped).sort(([a], [b]) => a.localeCompare(b)).map(([section, subs]) =>
-          `<div style="margin:2px 0;">${chip(section, 'neutral', '0 6px 0 0')}`
-          + `<span style="font-size:11px;color:${mutedColor};">${subs.map(escapeHtml).join(', ')}</span></div>`).join('');
-        return `<tr>`
-          + `<td style="padding:6px 8px;"><div>${policyLink(c.policyId, c.policyName)}</div><div style="font-size:11px;color:${mutedColor};">${escapeHtml(nodeClassLabel(c.nodeClass))} · #${c.policyId}</div></td>`
-          + `<td style="padding:6px 8px;font-size:12px;">${parent ? policyLink(parent.id, parent.name) : '–'}</td>`
-          + `<td style="padding:6px 8px;">${sections}</td>`
-          + `</tr>`;
-      }).join('')
-      + `</tbody></table>`;
-  } else if (failedChildLoads === 0) {
-    childSection = infoCard('success', 'fa-circle-check', 'No child-policy overrides', 'All child policies fully inherit from their parents.');
+    childSection += [...childWithOverrides].sort((a, b) => a.policyName.localeCompare(b.policyName)).map(renderChildOverrides).join('');
+  } else if (childOverridesStatus.source !== 'unavailable' && failedChildLoads === 0) {
+    childSection += infoCard('success', 'fa-circle-check', 'No child-policy overrides', 'All child policies fully inherit from their parents.');
   }
 
   return `<div>`
@@ -1316,7 +1398,7 @@ function generateCustomFieldHTML(policies, tree, overrideDetails = [], childPoli
     + statCard(inheritanceChains, 'Inheritance chains')
     + statCard(maxDepth, 'Max. depth')
     + statCard(overrideDetails.length, 'Devices with overrides')
-    + statCard(childOverrideStat, 'Child policies with overrides')
+    + statCard(childOverrideStat, childOverrideStatLabel)
     + `</div>`
     + `<h2 style="font-size:16px;margin:8px 0 4px;">Inheritance diagram</h2>`
     + legend
@@ -1331,9 +1413,55 @@ function generateCustomFieldHTML(policies, tree, overrideDetails = [], childPoli
 
 const fs = await import('node:fs');
 
+// Last successful console API result, so the report keeps showing child-policy overrides
+// (with their date) when the rotating sessionKey has expired.
+const childOverridesCachePath = new URL('./.child-policy-overrides-cache.json', import.meta.url);
+
+function readChildOverridesCache() {
+  try {
+    return JSON.parse(fs.readFileSync(childOverridesCachePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// Loads child-policy overrides live, falls back to the cache when the sessionKey is missing or expired
+async function loadChildPolicyOverrides(childPolicies) {
+  const cache = readChildOverridesCache();
+  const fromCache = reason => {
+    // Only keep entries for policies that are still child policies, with their current names
+    const current = new Map(childPolicies.map(p => [p.id, p]));
+    const entries = (cache?.childPolicyOverrides || [])
+      .filter(c => current.has(c.policyId))
+      .map(c => ({ ...c, policyName: current.get(c.policyId).name, parentPolicyId: current.get(c.policyId).parentPolicyId }));
+    console.warn(`Warning: ${reason}`);
+    if (!cache) return { childPolicyOverrides: [], status: { source: 'unavailable', fetchedAt: null, reason } };
+    console.warn(`Using cached child-policy overrides from ${new Date(cache.fetchedAt).toLocaleString('de-DE')}`);
+    return { childPolicyOverrides: entries, status: { source: 'cache', fetchedAt: cache.fetchedAt, reason } };
+  };
+
+  if (!sessionKey) return fromCache('No sessionKey provided.');
+  if (childPolicies.length === 0) return { childPolicyOverrides: [], status: { source: 'live', fetchedAt: new Date().toISOString() } };
+
+  const results = await fetchChildPolicyOverrides(childPolicies);
+  const failed = results.filter(c => c.error);
+  if (failed.length === childPolicies.length) {
+    return fromCache(`The sessionKey is invalid or expired (${failed[0].error}).`);
+  }
+  failed.forEach(c => console.warn(`Warning: child policy ${c.policyId} (${c.policyName}) could not be loaded: ${c.error}`));
+
+  // Failed single policies keep their last cached result instead of overwriting it with an error
+  const cachedById = new Map((cache?.childPolicyOverrides || []).map(c => [c.policyId, c]));
+  const toCache = results.map(c => (c.error && cachedById.has(c.policyId) ? cachedById.get(c.policyId) : c)).filter(c => !c.error);
+  const fetchedAt = new Date().toISOString();
+  fs.writeFileSync(childOverridesCachePath, JSON.stringify({ fetchedAt, childPolicyOverrides: toCache }, null, 2));
+
+  return { childPolicyOverrides: results, status: { source: 'live', fetchedAt } };
+}
+
 async function main() {
   try {
-    const missing = ['NINJA_CLIENT_ID', 'NINJA_CLIENT_SECRET', 'NINJA_SESSION_KEY'].filter(name => !process.env[name]);
+    const missing = ['NINJA_CLIENT_ID', 'NINJA_CLIENT_SECRET'].filter(name => !process.env[name]);
     if (missing.length > 0) {
       throw new Error(`Missing environment variables: ${missing.join(', ')}`);
     }
@@ -1357,7 +1485,7 @@ async function main() {
 
     const childPolicies = policies.filter(p => p.parentPolicyId);
     console.log(`Loading child-policy overrides for ${childPolicies.length} child policies...`);
-    const childPolicyOverrides = await fetchChildPolicyOverrides(childPolicies);
+    const { childPolicyOverrides, status: childOverridesStatus } = await loadChildPolicyOverrides(childPolicies);
     const withOverrides = childPolicyOverrides.filter(c => c.overriddenSections.length > 0);
     console.log(`Found ${withOverrides.length} child policies with overrides`);
 
@@ -1369,12 +1497,13 @@ async function main() {
     fs.writeFileSync('policy-orgchart.html', orgChartHtml);
     console.log('Org chart generated: policy-orgchart.html');
 
-    const customFieldHtml = generateCustomFieldHTML(policies, tree, overrideDetails, childPolicyOverrides, policyMap);
+    const customFieldHtml = generateCustomFieldHTML(policies, tree, overrideDetails, childPolicyOverrides, policyMap, childOverridesStatus);
     console.log(`Writing report to global custom field "${customFieldName}" (${customFieldHtml.length} characters)...`);
     await updateGlobalCustomField(customFieldName, customFieldHtml);
     console.log(`Custom field "${customFieldName}" updated`);
   } catch (error) {
-    console.error(error);
+    console.error(error.message || error);
+    process.exitCode = 1;
   }
 }
 
