@@ -9,6 +9,11 @@
     configured proxy, or both paths side by side.
 
     What is checked:
+      - NinjaOne agent service (NinjaRMMAgent): missing -> agent not installed,
+        stopped -> started immediately, running -> restarted after the tests
+      - Network adapters (LAN/WLAN), default gateway and actual internet
+        access (ICMP ping, DNS, TCP/443) - an adapter being "up" does not
+        mean the device has internet
       - Proxy configuration of the NinjaOne agent (registry) and of NinjaOne
         Remote (NC_PROXY), including format and consistency validation
       - System proxy (WinINET / WinHTTP / PAC / environment variables)
@@ -66,25 +71,45 @@
 .PARAMETER ExportCsv
     Path for a CSV export of all individual results.
 
+.PARAMETER NoServiceRestart
+    Only report the state of the NinjaRMMAgent service - do not start or
+    restart it.
+
 .EXAMPLE
-    .\Ninja_Allowlist_Test_EU_V3.3.ps1
+    .\Ninja_Allowlist_Test_EU_V3.4.ps1
     Detects the proxy automatically and tests the appropriate path.
 
 .EXAMPLE
-    .\Ninja_Allowlist_Test_EU_V3.3.ps1 -Mode Both
+    .\Ninja_Allowlist_Test_EU_V3.4.ps1 -Mode Both
     Compares direct vs. proxy - shows which path works where.
 
 .EXAMPLE
-    .\Ninja_Allowlist_Test_EU_V3.3.ps1 -ProxyHost 192.168.32.144 -ProxyPort 3128 -Mode Proxy
+    .\Ninja_Allowlist_Test_EU_V3.4.ps1 -ProxyHost 192.168.32.144 -ProxyPort 3128 -Mode Proxy
 
 .NOTES
-    Version : 3.3 (EU)
+    Version : 3.4 (EU)
     Based on: Ninja Remote Connection test V2.6 / Allowlist test V3.1-EU
     Sources : NinjaOne Global Allowlist Information  (as of 2026-08-17)
               NinjaOne Allowlist: EU Region          (as of 2026-08-17)
               NinjaOne Agent: Configuration for Use Over a Proxy Server
 
     Exit code: 0 = no critical failures, 1 = at least one critical failure
+
+    Changes vs. V3.3:
+      - Agent service check: the NinjaRMMAgent service is looked up first.
+        Not present -> the agent is not installed. Stopped -> it is started
+        immediately and checked for staying up (crash loop detection).
+        Running -> it is restarted after the connectivity tests. When the
+        script is executed by the NinjaOne agent itself (or as SYSTEM), the
+        restart is deferred to a one-shot scheduled task, because restarting
+        the agent synchronously would kill this script before its output is
+        uploaded. Requires elevation; -NoServiceRestart only reports.
+      - Internet check: active LAN/WLAN adapters, default gateway (ping),
+        ICMP ping to public resolvers, DNS resolution and a direct TCP/443
+        fallback (for networks that filter ICMP). Distinguishes "no network",
+        "network but no internet" and "no direct internet, proxy only". When
+        the device has no internet at all, the summary points out that the
+        allowlist failures are a consequence of that.
 
     Changes vs. V3.2:
       - Fix 4: Registry proxy validation. The value types prescribed by the
@@ -141,11 +166,12 @@ param (
     [switch] $IncludeCloudRdp,
     [switch] $IncludeIPv6,
     [switch] $SkipUdp,
-    [string] $ExportCsv
+    [string] $ExportCsv,
+    [switch] $NoServiceRestart
 )
 
 $ErrorActionPreference = 'Continue'
-$ScriptVersion = '3.3-EU'
+$ScriptVersion = '3.4-EU'
 $AllowlistAsOf = '2026-08-17 (Global) / 2026-08-17 (EU)'
 $IsWindowsOS   = ($env:OS -eq 'Windows_NT')
 
@@ -872,6 +898,399 @@ function Test-RemoteStaticIp {
 }
 
 # ============================================================================
+#  3b. Agent service and internet connectivity
+# ============================================================================
+
+$AgentServiceName   = 'NinjaRMMAgent'
+$AgentRestartTask   = 'NinjaOne-AllowlistTest-AgentRestart'
+$ServiceWaitSeconds = 60
+
+function Test-IsElevated {
+    if (-not $IsWindowsOS) { return $false }
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        return ([Security.Principal.WindowsPrincipal]$id).IsInRole(
+            [Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+function Test-RunningUnderNinjaAgent {
+    <#
+      Returns $true when this script was (probably) launched by the NinjaOne
+      agent. Restarting NinjaRMMAgent synchronously would then kill the script
+      host before the output is uploaded to NinjaOne.
+      Walks up the parent process chain; running as SYSTEM is treated as
+      "launched by the agent" as well, to stay on the safe side.
+    #>
+    try {
+        if ([Security.Principal.WindowsIdentity]::GetCurrent().IsSystem) { return $true }
+    } catch { }
+    try {
+        $procId = $PID
+        for ($depth = 0; $depth -lt 10 -and $procId; $depth++) {
+            $proc = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $procId" -ErrorAction Stop
+            if (-not $proc) { break }
+            if ($proc.Name -match '^(NinjaRMMAgent|ninjarmm-cli)') { return $true }
+            if ($proc.ParentProcessId -eq $procId) { break }
+            $procId = $proc.ParentProcessId
+        }
+    } catch { }
+    return $false
+}
+
+function Confirm-AgentServiceRunning {
+    <#
+      Waits until the service reports Running, then re-checks after a few
+      seconds - a service that starts and immediately stops again (crash
+      loop, broken installation) would otherwise be reported as healthy.
+    #>
+    param([string]$Action)
+
+    $cat = 'Agent service'
+    $svc = Get-Service -Name $AgentServiceName -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Write-Line 'FAIL' "Service '$AgentServiceName' disappeared after it was $Action"
+        Add-Result -Category $cat -Target $AgentServiceName -Check 'Service status' -Status 'FAIL' `
+                   -Detail "service no longer present after it was $Action"
+        return
+    }
+    try { $svc.WaitForStatus('Running', [TimeSpan]::FromSeconds($ServiceWaitSeconds)) } catch { }
+    $svc.Refresh()
+    if ($svc.Status -eq 'Running') {
+        Start-Sleep -Seconds 5
+        $svc.Refresh()
+    }
+
+    if ($svc.Status -eq 'Running') {
+        Write-Line 'OK' "Service '$AgentServiceName' $Action successfully and is running"
+        Add-Result -Category $cat -Target $AgentServiceName -Check 'Service status' -Status 'OK' `
+                   -Detail "$Action successfully - running"
+    } else {
+        $detail = "service was $Action but is not running (status: $($svc.Status)) - it may be crashing. Check the Windows event log and C:\ProgramData\NinjaRMMAgent\logs"
+        Write-Line 'FAIL' "Service '$AgentServiceName': $detail"
+        Add-Result -Category $cat -Target $AgentServiceName -Check 'Service status' -Status 'FAIL' -Detail $detail
+    }
+}
+
+function Invoke-AgentServiceCheck {
+    <#
+      Checks the NinjaRMMAgent service:
+        - not present -> agent not installed
+        - stopped     -> started immediately
+        - running     -> restart is requested; it runs AFTER the connectivity
+                         tests (see Invoke-AgentServiceRestart)
+      Returns $true when a restart is pending.
+    #>
+    $cat = 'Agent service'
+
+    if (-not $IsWindowsOS) {
+        Write-Line 'INFO' 'Agent service check skipped - only supported on Windows'
+        Add-Result -Category $cat -Target $AgentServiceName -Check 'Service status' -Status 'INFO' `
+                   -Critical $false -Detail 'non-Windows host'
+        return $false
+    }
+
+    $svc = Get-Service -Name $AgentServiceName -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Write-Line 'FAIL' "Service '$AgentServiceName' not found -> the NinjaOne agent is NOT installed on this device"
+        Add-Result -Category $cat -Target $AgentServiceName -Check 'Service present' -Status 'FAIL' `
+                   -Critical $false `
+                   -Detail 'service not present - NinjaOne agent is not installed (the allowlist results still apply to a future installation)'
+        return $false
+    }
+
+    $startType = $null
+    try { $startType = [string]$svc.StartType } catch { }
+    if (-not $startType) {
+        try {
+            $startType = (Get-CimInstance -ClassName Win32_Service -Filter "Name = '$AgentServiceName'" -ErrorAction Stop).StartMode
+        } catch { }
+    }
+    Write-Line 'INFO' "Service '$AgentServiceName' found - status: $($svc.Status), start type: $startType"
+    Add-Result -Category $cat -Target $AgentServiceName -Check 'Service present' -Status 'OK' `
+               -Detail "status: $($svc.Status), start type: $startType"
+
+    if ($startType -eq 'Disabled') {
+        $detail = "service is disabled and cannot be started. Re-enable it: Set-Service -Name $AgentServiceName -StartupType Automatic"
+        Write-Line 'FAIL' "Service '$AgentServiceName': $detail"
+        Add-Result -Category $cat -Target $AgentServiceName -Check 'Service status' -Status 'FAIL' -Detail $detail
+        return $false
+    }
+
+    if ($NoServiceRestart) {
+        if ($svc.Status -eq 'Running') {
+            Write-Line 'OK' "Service '$AgentServiceName' is running (-NoServiceRestart: no restart)"
+            Add-Result -Category $cat -Target $AgentServiceName -Check 'Service status' -Status 'OK' -Detail 'running'
+        } else {
+            Write-Line 'FAIL' "Service '$AgentServiceName' is $($svc.Status) (-NoServiceRestart: not started)"
+            Add-Result -Category $cat -Target $AgentServiceName -Check 'Service status' -Status 'FAIL' `
+                       -Detail "$($svc.Status) - not started because -NoServiceRestart was used"
+        }
+        return $false
+    }
+
+    if (-not (Test-IsElevated)) {
+        $st = if ($svc.Status -eq 'Running') { 'OK' } else { 'FAIL' }
+        Write-Line 'WARN' 'Not running elevated - the agent service cannot be started/restarted. Run as administrator or SYSTEM.'
+        Add-Result -Category $cat -Target $AgentServiceName -Check 'Service status' -Status $st `
+                   -Detail "$($svc.Status) - no (re)start possible without elevation"
+        return $false
+    }
+
+    switch ([string]$svc.Status) {
+        'Running' {
+            Write-Line 'INFO' "Service '$AgentServiceName' is running -> it will be restarted after the connectivity tests"
+            return $true
+        }
+        'StartPending' {
+            Write-Line 'INFO' "Service '$AgentServiceName' is starting - waiting up to ${ServiceWaitSeconds}s"
+            Confirm-AgentServiceRunning -Action 'started'
+            return $false
+        }
+        'StopPending' {
+            Write-Line 'INFO' "Service '$AgentServiceName' is stopping - waiting before starting it again"
+            try { $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds($ServiceWaitSeconds)) } catch { }
+        }
+    }
+
+    $svc.Refresh()
+    $prev = [string]$svc.Status
+    try {
+        if ($prev -eq 'Paused') {
+            Restart-Service -Name $AgentServiceName -Force -ErrorAction Stop
+        } else {
+            Start-Service -Name $AgentServiceName -ErrorAction Stop
+        }
+    } catch {
+        $detail = "service was $prev and could not be started: $($_.Exception.Message)"
+        Write-Line 'FAIL' "Service '$AgentServiceName': $detail"
+        Add-Result -Category $cat -Target $AgentServiceName -Check 'Service status' -Status 'FAIL' -Detail $detail
+        return $false
+    }
+    Confirm-AgentServiceRunning -Action "started (was $prev)"
+    return $false
+}
+
+function Invoke-AgentServiceRestart {
+    <#
+      Performs the restart requested by Invoke-AgentServiceCheck. Runs after
+      the tests so the connectivity results are not affected by the agent
+      reconnecting mid-test. When the script runs under the NinjaOne agent,
+      the restart is handed to a one-shot SYSTEM scheduled task so this
+      script can finish and upload its output first.
+    #>
+    if (-not $script:AgentRestartPending) { return }
+    $script:AgentRestartPending = $false
+    $cat = 'Agent service'
+
+    Write-Section 'NinjaOne agent service restart'
+
+    if (Test-RunningUnderNinjaAgent) {
+        $delay = 90
+        try {
+            $cmd = "Restart-Service -Name '$AgentServiceName' -Force; " +
+                   "Unregister-ScheduledTask -TaskName '$AgentRestartTask' -Confirm:`$false"
+            $action    = New-ScheduledTaskAction -Execute 'powershell.exe' `
+                             -Argument "-NoProfile -ExecutionPolicy Bypass -Command `"$cmd`""
+            $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds($delay)
+            $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+            Register-ScheduledTask -TaskName $AgentRestartTask -Action $action -Trigger $trigger `
+                                   -Principal $principal -Force -ErrorAction Stop | Out-Null
+
+            $detail = "script runs under the NinjaOne agent - restart deferred by ${delay}s via scheduled task '$AgentRestartTask' so the output can be uploaded first"
+            Write-Line 'INFO' "Service '$AgentServiceName': $detail"
+            Add-Result -Category $cat -Target $AgentServiceName -Check 'Service restart' -Status 'INFO' `
+                       -Critical $false -Detail $detail
+        } catch {
+            $detail = "could not schedule the deferred restart: $($_.Exception.Message) - restart the service manually"
+            Write-Line 'WARN' "Service '$AgentServiceName': $detail"
+            Add-Result -Category $cat -Target $AgentServiceName -Check 'Service restart' -Status 'WARN' `
+                       -Critical $false -Detail $detail
+        }
+        return
+    }
+
+    Write-Line 'INFO' "Restarting service '$AgentServiceName' ..."
+    try {
+        Restart-Service -Name $AgentServiceName -Force -ErrorAction Stop
+    } catch {
+        $detail = "restart failed: $($_.Exception.Message)"
+        Write-Line 'FAIL' "Service '$AgentServiceName': $detail"
+        Add-Result -Category $cat -Target $AgentServiceName -Check 'Service status' -Status 'FAIL' -Detail $detail
+        return
+    }
+    Confirm-AgentServiceRunning -Action 'restarted'
+}
+
+function Send-IcmpPing {
+    <# Returns the round-trip time in ms, or $null when no echo reply arrived. #>
+    param([string]$Address, [int]$TimeoutMs = 2000, [int]$Count = 2)
+    $ping = New-Object System.Net.NetworkInformation.Ping
+    try {
+        for ($n = 0; $n -lt $Count; $n++) {
+            try {
+                $reply = $ping.Send($Address, $TimeoutMs)
+                if ($reply.Status -eq [System.Net.NetworkInformation.IPStatus]::Success) {
+                    return [int]$reply.RoundtripTime
+                }
+            } catch { }
+        }
+        return $null
+    } finally {
+        $ping.Dispose()
+    }
+}
+
+function Test-InternetConnectivity {
+    <#
+      Checks whether the device has internet at all - independent of NinjaOne.
+      A LAN/WLAN adapter being "up" says nothing about internet access
+      (captive portal, missing gateway, blocked uplink, ...).
+
+        1. active network adapters (LAN/WLAN) and their default gateway
+        2. ICMP ping to the default gateway
+        3. ICMP ping to public resolvers (by IP -> independent of DNS)
+        4. DNS resolution of a public name
+        5. direct TCP/443 to public IPs (fallback when ICMP is filtered)
+
+      Returns 'OK', 'ProxyOnly' (no direct internet, but a proxy is
+      configured) or 'None'.
+    #>
+    param([bool]$ProxyConfigured)
+
+    $cat = 'Internet connectivity'
+
+    # --- 1. Adapters ---------------------------------------------------------
+    $adapters = @()
+    try {
+        $adapters = @([System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+            Where-Object {
+                $_.OperationalStatus -eq 'Up' -and
+                @('Loopback', 'Tunnel') -notcontains [string]$_.NetworkInterfaceType
+            })
+    } catch { }
+
+    if ($adapters.Count -eq 0) {
+        Write-Line 'FAIL' 'No active network adapter (LAN/WLAN) - the device is offline'
+        Add-Result -Category $cat -Target 'Network adapters' -Check 'Adapter up' -Status 'FAIL' `
+                   -Detail 'no network interface in state Up'
+        return 'None'
+    }
+
+    $gateways = New-Object System.Collections.Generic.List[string]
+    foreach ($a in $adapters) {
+        $kind = switch -Wildcard ([string]$a.NetworkInterfaceType) {
+            'Wireless80211' { 'WLAN' }
+            '*Ethernet*'    { 'LAN' }
+            default         { [string]$a.NetworkInterfaceType }
+        }
+        $ipProps = $a.GetIPProperties()
+        $v4  = @($ipProps.UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } |
+                 ForEach-Object { $_.Address.ToString() })
+        $gws = @($ipProps.GatewayAddresses | Where-Object {
+                    $_.Address.AddressFamily -eq 'InterNetwork' -and $_.Address.ToString() -ne '0.0.0.0' } |
+                 ForEach-Object { $_.Address.ToString() })
+        foreach ($g in $gws) { if (-not $gateways.Contains($g)) { $gateways.Add($g) } }
+
+        $ipText = if ($v4.Count) { $v4 -join ', ' } else { 'no IPv4' }
+        $gwText = if ($gws.Count) { $gws -join ', ' } else { 'none' }
+        Write-Line 'INFO' ("{0,-4} '{1}' ({2}) - IP: {3}, gateway: {4}" -f $kind, $a.Name, $a.Description, $ipText, $gwText)
+        Add-Result -Category $cat -Target $a.Name -Check "Adapter ($kind)" -Status 'INFO' -Critical $false `
+                   -Detail "$($a.Description) - IP: $ipText, gateway: $gwText"
+    }
+
+    # --- 2. Default gateway ------------------------------------------------------
+    if ($gateways.Count -eq 0) {
+        Write-Line 'WARN' 'Adapters are up but no IPv4 default gateway is configured - there is no route to the internet'
+        Add-Result -Category $cat -Target 'Default gateway' -Check 'Gateway present' -Status 'WARN' -Critical $false `
+                   -Detail 'no IPv4 default gateway on any active adapter'
+    }
+    foreach ($g in $gateways) {
+        $rtt = Send-IcmpPing -Address $g
+        if ($null -ne $rtt) {
+            Write-Line 'OK' "Default gateway $g answers ping (${rtt} ms)"
+            Add-Result -Category $cat -Target 'Default gateway' -Address $g -Check 'ICMP ping' -Status 'OK' `
+                       -Critical $false -Detail "${rtt} ms"
+        } else {
+            Write-Line 'WARN' "Default gateway $g does not answer ping (may just filter ICMP)"
+            Add-Result -Category $cat -Target 'Default gateway' -Address $g -Check 'ICMP ping' -Status 'WARN' `
+                       -Critical $false -Detail 'no echo reply - gateway unreachable or ICMP filtered'
+        }
+    }
+
+    # --- 3. ICMP to public resolvers ---------------------------------------------
+    $icmpOk = $false
+    foreach ($ip in @('1.1.1.1', '8.8.8.8', '9.9.9.9')) {
+        $rtt = Send-IcmpPing -Address $ip
+        if ($null -ne $rtt) {
+            Write-Line 'OK' "Ping $ip ok (${rtt} ms)"
+            Add-Result -Category $cat -Target 'Public internet' -Address $ip -Check 'ICMP ping' -Status 'OK' `
+                       -Critical $false -Detail "${rtt} ms"
+            $icmpOk = $true
+            break
+        }
+        Write-Line 'INFO' "Ping $ip - no reply"
+    }
+
+    # --- 4. DNS -----------------------------------------------------------------
+    $dnsName = 'www.msftconnecttest.com'
+    $dnsOk = $false
+    try {
+        $addr = @([System.Net.Dns]::GetHostAddresses($dnsName))
+        if ($addr.Count -gt 0) {
+            $dnsOk = $true
+            Write-Line 'OK' "DNS resolution of $dnsName ok ($($addr[0]))"
+            Add-Result -Category $cat -Target 'Public internet' -Check 'DNS' -Status 'OK' -Critical $false `
+                       -Detail "$dnsName -> $(($addr | ForEach-Object { $_.ToString() }) -join ', ')"
+        }
+    } catch {
+        Write-Line 'WARN' "DNS resolution of $dnsName failed: $($_.Exception.Message)"
+        Add-Result -Category $cat -Target 'Public internet' -Check 'DNS' -Status 'WARN' -Critical $false `
+                   -Detail $_.Exception.Message
+    }
+
+    # --- 5. TCP/443 fallback (only needed when ICMP is filtered) ---------------
+    $tcpOk = $false
+    if (-not $icmpOk) {
+        foreach ($ip in @('1.1.1.1', '8.8.8.8')) {
+            try {
+                $c = New-TcpClientWithTimeout -Address $ip -Port 443 -TimeoutMs ([Math]::Min($Timeout, 3000))
+                try { $c.Close() } catch { }
+                $tcpOk = $true
+                Write-Line 'OK' "Direct TCP/443 to $ip ok - ICMP is filtered, but the internet is reachable"
+                Add-Result -Category $cat -Target 'Public internet' -Address $ip -Check 'TCP/443' -Status 'OK' `
+                           -Critical $false -Detail 'ICMP filtered, TCP works'
+                break
+            } catch {
+                Write-Line 'INFO' "Direct TCP/443 to $ip - no connection"
+            }
+        }
+    }
+
+    # --- Verdict ----------------------------------------------------------------
+    if ($icmpOk -or $tcpOk) {
+        Write-Line 'OK' 'The device has internet access'
+        Add-Result -Category $cat -Target 'Internet access' -Check 'Verdict' -Status 'OK' `
+                   -Detail $(if ($icmpOk) { 'public IPs answer ping' } else { 'ICMP filtered, direct TCP/443 works' })
+        return 'OK'
+    }
+    if ($ProxyConfigured) {
+        $detail = 'no direct internet access (ping and TCP/443 fail), but a proxy is configured - internet access via the proxy is verified by the proxy tests below'
+        Write-Line 'WARN' $detail
+        Add-Result -Category $cat -Target 'Internet access' -Check 'Verdict' -Status 'WARN' -Critical $false -Detail $detail
+        return 'ProxyOnly'
+    }
+    $detail = if ($dnsOk) {
+        'network is up and DNS resolves (internal resolver), but the internet is not reachable - check the uplink/firewall, captive portal or gateway'
+    } else {
+        'network adapter is up, but neither ping, DNS nor TCP/443 reach the internet - the device has no internet'
+    }
+    Write-Line 'FAIL' $detail
+    Add-Result -Category $cat -Target 'Internet access' -Check 'Verdict' -Status 'FAIL' -Detail $detail
+    return 'None'
+}
+
+# ============================================================================
 #  4. Header and proxy analysis
 # ============================================================================
 
@@ -884,6 +1303,14 @@ Write-Host " Host           : $env:COMPUTERNAME   $(Get-Date -Format 'yyyy-MM-dd
 Write-Host '===============================================================' -ForegroundColor Cyan
 
 $cfg = Get-NinjaProxyConfig
+
+Write-Section 'NinjaOne agent service'
+$AgentRestartPending = Invoke-AgentServiceCheck
+
+Write-Section 'Network and internet connectivity'
+$proxyConfigured = [bool]($ProxyHost -or $cfg.AgentProxy -or $cfg.NcProxyRaw -or $cfg.WinInet -or
+                          $cfg.WinInetPac -or $cfg.WinHttp -or $cfg.EnvProxy)
+$InternetState = Test-InternetConnectivity -ProxyConfigured $proxyConfigured
 
 Write-Section 'Proxy configuration'
 
@@ -1070,7 +1497,7 @@ if ($paths -contains 'Proxy') {
                    -Check 'Proxy reachable' -Status 'FAIL' -Detail $_.Exception.Message
         Write-Host ''
         Write-Host ' Aborting: proxy tests are meaningless without a reachable proxy.' -ForegroundColor Red
-        if ($paths -notcontains 'Direct') { exit 1 }
+        if ($paths -notcontains 'Direct') { Invoke-AgentServiceRestart; exit 1 }
         $paths = @('Direct')
     }
 }
@@ -1264,7 +1691,13 @@ foreach ($path in $paths) {
 Write-Progress -Activity 'NinjaOne allowlist test (EU)' -Completed
 
 # ============================================================================
-#  7. Summary
+#  7. Agent service restart (requested in the service check)
+# ============================================================================
+
+Invoke-AgentServiceRestart
+
+# ============================================================================
+#  8. Summary
 # ============================================================================
 
 $fails = @($Results | Where-Object { $_.Status -eq 'FAIL' })
@@ -1304,6 +1737,28 @@ if ($criticalFails.Count -gt 0) {
         $checks = (($_.Group | Select-Object -ExpandProperty Check -Unique) -join ', ')
         Write-Host ("   - {0}  ({1})" -f $_.Name, $checks) -ForegroundColor Red
     }
+    Write-Host ''
+}
+
+# --- Internet connectivity advisory --------------------------------------------
+if ($InternetState -eq 'None') {
+    Write-Host ' No internet connectivity:' -ForegroundColor Red
+    Write-Host '   The device has an active network adapter but cannot reach the internet.' -ForegroundColor Red
+    Write-Host '   The allowlist failures above are most likely a CONSEQUENCE of this and'   -ForegroundColor Red
+    Write-Host '   not an allowlist problem. Fix the uplink (gateway, firewall, captive'      -ForegroundColor Red
+    Write-Host '   portal, WLAN login) first, then run this test again.'                     -ForegroundColor Red
+    Write-Host ''
+} elseif ($InternetState -eq 'ProxyOnly') {
+    Write-Host ' Internet connectivity: no direct internet access - only via proxy.' -ForegroundColor Yellow
+    Write-Host '   Direct-path failures are expected; the proxy-path results are decisive.' -ForegroundColor Yellow
+    Write-Host ''
+}
+
+# --- Agent service advisory ------------------------------------------------------
+$svcIssues = @($Results | Where-Object { $_.Category -eq 'Agent service' -and $_.Status -in @('WARN','FAIL') })
+if ($svcIssues.Count -gt 0) {
+    Write-Host ' NinjaOne agent service - action required:' -ForegroundColor Yellow
+    $svcIssues | ForEach-Object { Write-Host ("   - {0}: {1}" -f $_.Check, $_.Detail) -ForegroundColor Yellow }
     Write-Host ''
 }
 
