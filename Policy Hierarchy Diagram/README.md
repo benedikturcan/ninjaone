@@ -2,8 +2,6 @@
 
 Visualize your complete policy inheritance and every policy override in a single NinjaOne custom field, generated automatically by a PowerShell automation script.
 
-![Policy Hierarchy Report](docs/screenshot-diagram.png)
-
 ---
 
 ## TL;DR
@@ -73,8 +71,6 @@ Total policies, inheritance chains, maximum depth, devices with overrides and ch
 ### 3. Deviations
 - **Device overrides:** device, full policy chain, overridden sections.
 - **Child-policy overrides:** one block per child policy with the columns **Area · Setting · Parent value · Child value**.
-
-![Child-policy overrides](docs/screenshot-overrides.png)
 
 ---
 
