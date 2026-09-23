@@ -1,38 +1,6 @@
 <#
 .SYNOPSIS
-[Version 1.4.0] Installs one or more Winget packages in machine scope under SYSTEM.
-Change Log:
-- 1.4.4: Removed all auto-bootstrap logic (Add-AppxPackage is denied under SYSTEM,
-         module installs are out of scope). If winget is missing or broken the script
-         fails fast with remediation guidance.
-- 1.4.2: winget discovery now probes each candidate with 'winget --version' and falls
-         back to the next one. Fixes endpoints where the newest WindowsApps folder is a
-         staged/broken App Installer that crashes with 0xC0000135 (STATUS_DLL_NOT_FOUND).
-- 1.4.1: Fixed empty exit codes from Start-Process -PassThru (PS 5.1 requires caching
-         the process handle before exit, otherwise .ExitCode is $null). Added null-safe
-         exit code reporting.
-- 1.4.0: QA rework:
-         * Fixed output-stream contamination (Write-Log no longer pollutes function return values).
-         * Deterministic exit codes: exit 1 on any package failure or fatal error.
-         * Locale-independent handling: scope-check parse failures no longer block installs;
-           "already installed" detected via winget exit codes (0x8A150061 / 0x8A15002B) first.
-         * Device architecture detected from PROCESSOR_ARCHITECTURE(/W6432); the 'architecture'
-           input is now the *requested* target architecture and is passed to winget install.
-         * Hardened bootstrap (TLS 1.2, -UseBasicParsing, try/catch, temp cleanup, clear guidance).
-         * Proper argument quoting for Start-Process + input validation of Id/Version (injection safe).
-         * Install runs with a timeout; timeouts kill the whole process tree (taskkill /T).
-         * winget discovery works under SYSTEM and PowerShell 7 (WindowsApps scan, Appx fallback).
-         * Shortcut copy uses token matching only - no more "copy whatever changed last" fallback.
-         * Elevation check, guarded file logging, temp file cleanup, PSSA-friendly verbs,
-           removed dead code and automatic-variable shadowing, special-folder APIs for paths.
-- 1.3.1: Removed pinning workflow and clarified NinjaOne custom field inputs.
-- 1.3.0: Optional exact-version install + installed-version pinning with end summary.
-- 1.2.0: Copy Start Menu shortcut to Public Desktop after install.
-- 1.1.1: Standardized warning output to [Warning].
-- 1.1.0: Single-file packaging.
-Example output:
-2026-09-22 12:00:00 [Info] Starting winget machine install for Ids=Microsoft.PowerShell
-2026-09-22 12:00:00 [Info] LogPath=C:\Windows\Temp\winget-install-Microsoft.PowerShell-20260922-120000.log
+[Version 1.4.4] Installs one or more Winget packages in machine scope under SYSTEM.
 
 .DESCRIPTION
 Ensures winget is available, validates machine scope support where possible, and installs
