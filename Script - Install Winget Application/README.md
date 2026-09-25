@@ -1,68 +1,68 @@
 # Install-WingetMachine.ps1
 
-Installiert ein oder mehrere Winget-Pakete im Machine-Scope. Ausgelegt für den Einsatz
-als NinjaOne-Automation unter dem SYSTEM-Konto, funktioniert aber in jedem elevated
-Kontext. Aktuelle Version: **1.4.4**.
+Installs one or more Winget packages in machine scope. Designed to run as a NinjaOne
+automation under the SYSTEM account, but works in any elevated context. Current
+version: **1.4.4**.
 
-## Voraussetzungen
+## Prerequisites
 
-- Windows 10/11 (x64 oder ARM64), Windows PowerShell 5.1 oder PowerShell 7
-- Ausfuehrung elevated (SYSTEM oder Administrator) – wird vom Skript geprueft
-- Funktionsfaehiges winget (App Installer >= ca. 1.4) auf dem Endpoint
-  - Das Skript findet winget auch unter SYSTEM (Scan von `%ProgramFiles%\WindowsApps`)
-    und prueft jeden Kandidaten per `winget --version`, bevor er verwendet wird
-  - Das Skript repariert winget **nicht** selbst (bewusste Design-Entscheidung, s. u.)
-- Windows Server 2022: winget wird dort von Microsoft nicht ausgeliefert und nicht
-  offiziell unterstuetzt. Nachruesten ist moeglich (s. Troubleshooting), aber fuer
-  Server ist ein direkter Vendor-Installer meist die robustere Wahl.
+- Windows 10/11 (x64 or ARM64), Windows PowerShell 5.1 or PowerShell 7
+- Elevated execution (SYSTEM or administrator) – enforced by the script
+- A functional winget (App Installer >= approx. 1.4) on the endpoint
+  - The script locates winget even under SYSTEM (scans `%ProgramFiles%\WindowsApps`)
+    and probes every candidate with `winget --version` before using it
+  - The script does **not** repair winget itself (deliberate design decision, see below)
+- Windows Server 2022: winget does not ship with it and is not officially supported
+  by Microsoft. It can be retrofitted (see Troubleshooting), but for servers a direct
+  vendor installer is usually the more robust choice.
 
-## Einrichtung in NinjaOne
+## NinjaOne setup
 
-Skript als PowerShell-Automation anlegen, Ausfuehrung **als System**. Erfolg wird ueber
-den Exit-Code bewertet (0 = Erfolg, 1 = Fehler).
+Create the script as a PowerShell automation, run **as System**. Success is evaluated
+via the exit code (0 = success, 1 = failure).
 
-Drei Script Variables anlegen und als dynamische Skriptvariablen mappen. Die Namen
-muessen exakt stimmen (das Skript liest sie ueber `$env:`):
+Create three script variables and map them as dynamic script variables. The names
+must match exactly (the script reads them via `$env:`):
 
-| Variable        | Typ            | Pflicht | Beschreibung |
-|-----------------|----------------|---------|--------------|
-| `wingetId`      | Text           | ja      | Winget-Paket-ID, mehrere kommagetrennt. Beispiel: `Microsoft.PowerShell` oder `Microsoft.PowerShell,7zip.7zip`. Erlaubte Zeichen: Buchstaben, Ziffern, `. + _ -` |
-| `wingetVersion` | Text           | nein    | Exakte Version(en), kommagetrennt. Anzahl muss bei Befuellung der Anzahl der IDs entsprechen. Leer = neueste Version |
-| `architecture`  | Text/Dropdown  | nein    | Erzwungene Zielarchitektur: `x64`, `x86` oder `arm64`. Leer = Geraetearchitektur wird automatisch ermittelt (empfohlener Standard) |
+| Variable        | Type           | Required | Description |
+|-----------------|----------------|----------|-------------|
+| `wingetId`      | Text           | yes      | Winget package ID, comma-separated for multiple packages. Example: `Microsoft.PowerShell` or `Microsoft.PowerShell,7zip.7zip`. Allowed characters: letters, digits, `. + _ -` |
+| `wingetVersion` | Text           | no       | Exact version(s), comma-separated. When set, the count must match the number of IDs. Empty = latest version |
+| `architecture`  | Text/Dropdown  | no       | Forced target architecture: `x64`, `x86`, or `arm64`. Empty = device architecture is detected automatically (recommended default) |
 
-## Parameter (optional, ohne Script Variables)
+## Parameters (optional, without script variables)
 
-| Parameter                | Default | Beschreibung |
-|--------------------------|---------|--------------|
-| `-Id`                    | `$env:wingetId` | Paket-ID(s) |
-| `-Version`               | `$env:wingetVersion` | Version(en) |
-| `-Architecture`          | `$env:architecture` | Zielarchitektur |
-| `-LogPath`               | auto    | Pfad der Logdatei; Default: `%TEMP%\winget-install-<Id>-<Zeitstempel>.log` (unter SYSTEM: `C:\Windows\Temp`) |
-| `-ShowTimeoutSeconds`    | 120     | Timeout fuer `winget show` (Scope-Pruefung) |
-| `-InstallTimeoutSeconds` | 1800    | Timeout fuer `winget install`; bei Timeout wird der gesamte Prozessbaum beendet |
+| Parameter                | Default | Description |
+|--------------------------|---------|-------------|
+| `-Id`                    | `$env:wingetId` | Package ID(s) |
+| `-Version`               | `$env:wingetVersion` | Version(s) |
+| `-Architecture`          | `$env:architecture` | Target architecture |
+| `-LogPath`               | auto    | Log file path; default: `%TEMP%\winget-install-<Id>-<timestamp>.log` (under SYSTEM: `C:\Windows\Temp`) |
+| `-ShowTimeoutSeconds`    | 120     | Timeout for `winget show` (scope check) |
+| `-InstallTimeoutSeconds` | 1800    | Timeout for `winget install`; on timeout the whole process tree is terminated |
 
-## Verhalten
+## Behavior
 
-1. Elevation-Check, winget-Suche inkl. Funktionsprobe
-2. Pro Paket: Validierung von Id/Version, `winget show` zur Machine-Scope-Pruefung
-   (schlaegt das Parsen fehl, z. B. wegen lokalisierter winget-Ausgabe, wird die
-   Installation trotzdem versucht und im Log als `Indeterminate` markiert)
-3. `winget install --scope machine --silent`; "bereits installiert" wird ueber
-   winget-Exit-Codes erkannt und zaehlt als Erfolg (`AlreadyInstalled`)
-4. Kopie der passenden Startmenue-Verknuepfung auf den Public Desktop
-   (Token-Matching gegen die Paket-ID; keine Kopie, wenn nichts passt)
-5. Zusammenfassung pro Paket im Log, Exit-Code 0/1
+1. Elevation check, winget discovery including a functional probe
+2. Per package: validation of Id/Version, `winget show` for the machine-scope check
+   (if parsing fails, e.g. due to localized winget output, the installation is still
+   attempted and logged as `Indeterminate`)
+3. `winget install --scope machine --silent`; "already installed" is detected via
+   winget exit codes and counts as success (`AlreadyInstalled`)
+4. Copies the matching Start Menu shortcut to the Public Desktop
+   (token matching against the package ID; nothing is copied if nothing matches)
+5. Per-package summary in the log, exit code 0/1
 
-Exit-Codes: **0** = alle Pakete erfolgreich (inkl. AlreadyInstalled),
-**1** = mindestens ein Paket fehlgeschlagen oder fataler Fehler.
+Exit codes: **0** = all packages succeeded (including AlreadyInstalled),
+**1** = at least one package failed or a fatal error occurred.
 
-## Troubleshooting (bekannte Fehlerbilder)
+## Troubleshooting (known failure patterns)
 
 **`winget candidate failed startup probe ... 0xC0000135`**
-Der App Installer auf dem Geraet ist beschaedigt oder nur teilweise installiert
-(STATUS_DLL_NOT_FOUND, typischerweise fehlende VCLibs/UI.Xaml-Abhaengigkeiten).
-Das Skript verwirft den Kandidaten und probiert aeltere Versionsordner. Gibt es
-keinen funktionierenden, bricht es ab. Reparatur einmalig elevated ausfuehren:
+The App Installer on the device is broken or only partially installed
+(STATUS_DLL_NOT_FOUND, typically missing VCLibs/UI.Xaml dependencies).
+The script discards the candidate and tries older version folders. If no working
+one exists, it aborts. Run the repair once, elevated:
 
 ```powershell
 Install-Module Microsoft.WinGet.Client -Force
@@ -70,39 +70,38 @@ Repair-WinGetPackageManager -AllUsers -Force -Latest
 ```
 
 **`winget is not available or not functional on this device`**
-Kein funktionsfaehiges winget gefunden. Gleiche Reparatur wie oben. Das Skript
-repariert bewusst nicht selbst: `Add-AppxPackage` ist unter SYSTEM von Windows
-blockiert (0x80073CF9), und Modul-Installationen als Nebeneffekt eines
-Install-Skripts sind unerwuenscht. Die Reparatur gehoert in ein separates
-Remediation-Skript.
+No functional winget found. Same repair as above. The script deliberately does not
+repair on its own: `Add-AppxPackage` is blocked by Windows under SYSTEM (0x80073CF9),
+and installing modules as a side effect of an install script is undesirable. The
+repair belongs in a separate remediation script.
 
 **`Wrapped installer reported its own exit code: <n>`**
-winget selbst lief sauber, der Hersteller-Installer ist gescheitert. Der Code ist
-herstellerspezifisch (Beispiel Citrix Workspace: Codes 4xxxx, dokumentiert in
-Citrix CTX695019). In den Installer-Logs des Herstellers nachsehen.
+winget itself ran fine; the vendor's installer failed. The code is vendor-specific
+(example Citrix Workspace: 4xxxx codes, documented in Citrix CTX695019). Check the
+vendor's installer logs.
 
-**ARM64-Geraete**
-Bietet das winget-Manifest keinen ARM64-Installer an, laedt winget den x64-Installer
-(Emulation). Manche Installer (z. B. Citrix Workspace) scheitern dann. Vorab pruefen
-mit `winget show <Id>` (Installer-Bloecke ansehen); ggf. den nativen ARM64-Installer
-des Herstellers separat ausrollen.
+**ARM64 devices**
+If the winget manifest does not offer an ARM64 installer, winget downloads the x64
+installer (emulation). Some installers (e.g. Citrix Workspace) fail in that case.
+Check upfront with `winget show <Id>` (inspect the installer blocks); if needed,
+deploy the vendor's native ARM64 installer separately.
 
-**Uneinheitliche Ergebnisse auf Bestandsgeraeten**
-Manuell installierte Altversionen werden von winget teils unter anderer ID erkannt
-(Beispiel: alte Citrix-Installationen als `CitrixOnlinePluginPackWeb`). winget
-installiert dann ggf. "drueber" statt `AlreadyInstalled` zu melden.
+**Inconsistent results on existing devices**
+Manually installed legacy versions are sometimes recognized by winget under a
+different ID (example: old Citrix installations as `CitrixOnlinePluginPackWeb`).
+winget may then install "on top" instead of reporting `AlreadyInstalled`.
 
-## Logdatei
+## Log file
 
-Zusaetzlich zur NinjaOne-Ausgabe schreibt das Skript nach
-`C:\Windows\Temp\winget-install-<Id>-<Zeitstempel>.log` (unter SYSTEM).
-Format: `yyyy-MM-dd HH:mm:ss [Level] Nachricht`. Fehler gehen zusaetzlich auf
-stderr und erscheinen in NinjaOne rot.
+In addition to the NinjaOne output, the script writes to
+`C:\Windows\Temp\winget-install-<Id>-<timestamp>.log` (under SYSTEM).
+Format: `yyyy-MM-dd HH:mm:ss [Level] Message`. Errors additionally go to
+stderr and appear red in NinjaOne.
 
 ## Changelog
 
-Siehe Kopfkommentar in `Install-WingetMachine.ps1`.
+See the header comment in `Install-WingetMachine.ps1`.
 
-## Haftungsausschluss
+## Disclaimer
 
-Bereitgestellt wie besehen (AS IS), ohne Gewaehr. Nutzung auf eigenes Risiko.
+Provided AS IS, without warranty of any kind. Use at your own risk.
