@@ -232,6 +232,23 @@ function ConvertTo-Array($Value) {
     @($Value)
 }
 
+# Parse a human-readable size like "230 MB" or "4.2 GB" (or "4,2 GB") back into bytes. The last
+# separator is treated as the decimal point, so a thousands separator does not distort the value.
+function ConvertFrom-SizeText([string]$Text) {
+    $m = [regex]::Match($Text, '(?i)([0-9][0-9.,]*)\s*(TB|GB|MB|KB|B)\b')
+    if (-not $m.Success) { return [long]0 }
+    $raw = $m.Groups[1].Value -replace '[.,](?=.*[.,])', ''   # drop all separators except the last
+    $num = 0.0
+    [void][double]::TryParse(($raw -replace ',', '.'), [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$num)
+    switch ($m.Groups[2].Value.ToUpperInvariant()) {
+        'TB' { [long]($num * 1099511627776) }
+        'GB' { [long]($num * 1073741824) }
+        'MB' { [long]($num * 1048576) }
+        'KB' { [long]($num * 1024) }
+        default { [long]$num }
+    }
+}
+
 # Fallback for the human-readable tag field (e.g. "AI Tag"): turn its lines back into the same shape
 # as the JSON, so the dashboard works even when only the human-readable field is populated / readable.
 function ConvertFrom-AiTagText([string]$Text) {
@@ -240,6 +257,8 @@ function ConvertFrom-AiTagText([string]$Text) {
     $packages = New-Object System.Collections.Generic.List[string]
     $mldll = New-Object System.Collections.Generic.List[string]
     $apiServers = New-Object System.Collections.Generic.List[string]
+    $models = New-Object System.Collections.Generic.List[object]
+    $modelFiles = $null
 
     foreach ($line in ($Text -split '\r?\n')) {
         $l = $line.Trim()
@@ -257,7 +276,16 @@ function ConvertFrom-AiTagText([string]$Text) {
             continue
         }
         if ($l -like 'Local LLM server*') { $apiServers.Add($l); continue }
-        if ($l -like 'Local AI models:*' -or $l -like 'Local model files:*') { continue }  # no reliable byte count from text
+        # "Local AI models: Ollama models (4.2 GB), Hugging Face cache (11.8 GB)" - sum the sizes in parens
+        if ($l -like 'Local AI models:*') {
+            foreach ($mm in [regex]::Matches($l, '\(([^)]+)\)')) { $models.Add([pscustomobject]@{ label = ''; bytes = (ConvertFrom-SizeText $mm.Groups[1].Value) }) }
+            continue
+        }
+        # "Local model files: 2 file(s), 230 MB (.gguf, .safetensors)"
+        if ($l -like 'Local model files:*') {
+            $modelFiles = [pscustomobject]@{ count = 0; bytes = (ConvertFrom-SizeText $l); exts = @() }
+            continue
+        }
         # Otherwise a tool line: "Name (evidence, evidence)"
         $name = $l; $evidence = ''
         $paren = $l.IndexOf(' (')
@@ -272,7 +300,7 @@ function ConvertFrom-AiTagText([string]$Text) {
 
     [pscustomobject]@{
         tools = $tools; apiKeys = $apiKeys; packages = $packages; mldll = $mldll
-        apiServers = $apiServers; models = @(); modelFiles = $null; host = $null
+        apiServers = $apiServers; models = $models; modelFiles = $modelFiles; host = $null
     }
 }
 
