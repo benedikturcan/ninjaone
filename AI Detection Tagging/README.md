@@ -161,7 +161,7 @@ The central component. It runs on **one** device (or on a schedule), authenticat
 
 ### What the dashboard shows
 - **KPI cards:** devices scanned, devices with AI, distinct AI tools, devices running AI *now*, devices with API keys, total local model storage across the fleet.
-- **AI tools across the fleet:** every tool with device count, a proportion bar, an *installed vs. running* status, and **on which devices** (linked device names).
+- **AI tools by device (cards):** one card per tool with a brand-coloured badge, the *installed vs. running* status, the device count, and **which devices use it** listed below (linked). NinjaOne WYSIWYG blocks `<img>` and `<svg>`, so real product logos are not possible - the badge is a brand-coloured monogram (e.g. terracotta "C" for Claude), the closest the sanitizer allows.
 - **By category:** local runtime / desktop app / AI editor / coding assistant / CLI.
 - **Shadow-AI signals:** devices exposing a local LLM API and devices running an unidentified ML runtime.
 - **AI API keys by provider** and **AI SDKs (pip/npm) by package**, each with the device list.
