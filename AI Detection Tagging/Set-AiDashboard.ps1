@@ -61,6 +61,7 @@ if (-not $DashboardFieldName) { $DashboardFieldName = 'aiDashboard' }
 
 $ApiUrl = "https://$Region.ninjarmm.com"
 $Invariant = [Globalization.CultureInfo]::InvariantCulture
+$script:DeviceNames = @{}   # deviceId -> name, filled by the bulk list and per-device lookups
 
 #region HTTP
 
@@ -111,23 +112,36 @@ function Set-GlobalCustomField {
 
 #region Data retrieval
 
+function Get-DeviceName($Device) {
+    if ($null -eq $Device) { return $null }
+    if ($Device.displayName) { return "$($Device.displayName)" }
+    if ($Device.systemName) { return "$($Device.systemName)" }
+    if ($Device.dnsName) { return "$($Device.dnsName)" }
+    if ($Device.netbiosName) { return "$($Device.netbiosName)" }
+    $null
+}
+
+# Best-effort bulk name load. Handles the same shapes as the custom-field query (results / devices /
+# bare array) and only stores real names, so anything it misses falls back to a per-device lookup.
 function Get-AllDevices {
-    $devices = @{}
     $after = 0
+    $count = 0
     while ($true) {
-        $batch = @(Invoke-NinjaApi ("/v2/devices?pageSize=1000&after={0}" -f $after))
+        $response = Invoke-NinjaApi ("/v2/devices?pageSize=1000&after={0}" -f $after)
+        $batch = @()
+        if ($null -eq $response) { $batch = @() }
+        elseif ($response.PSObject.Properties['results']) { $batch = @($response.results) }
+        elseif ($response.PSObject.Properties['devices']) { $batch = @($response.devices) }
+        elseif ($response -is [System.Collections.IEnumerable] -and $response -isnot [string]) { $batch = @($response) }
+        else { $batch = @($response) }
         if ($batch.Count -eq 0) { break }
+
         foreach ($device in $batch) {
-            if ($null -eq $device) { continue }
-            $id = "$($device.id)"
-            if (-not $id) { continue }
-            $name = if ($device.displayName) { "$($device.displayName)" }
-            elseif ($device.systemName) { "$($device.systemName)" }
-            else { "Device $id" }
-            $devices[$id] = $name
+            if ($null -eq $device -or -not $device.id) { continue }
+            $name = Get-DeviceName $device
+            if ($name) { $script:DeviceNames["$($device.id)"] = $name; $count++ }
         }
-        # Cursor is the last device id. Parse defensively (no [int] cast that can throw on odd shapes)
-        # and stop when the page is short or the cursor does not advance, so we never loop forever.
+
         if ($batch.Count -lt 1000) { break }
         $lastId = [int64]0
         $last = $batch | Select-Object -Last 1
@@ -135,7 +149,19 @@ function Get-AllDevices {
         if ($lastId -le $after) { break }
         $after = $lastId
     }
-    $devices
+    $count
+}
+
+# Reliable per-device name (the pattern the Policy Hierarchy Report uses). Cached, and only called
+# for devices that actually report AI, so it stays cheap even on a large fleet.
+function Resolve-DeviceName([string]$Id) {
+    if (-not $Id) { return 'Unknown device' }
+    if ($script:DeviceNames.ContainsKey($Id)) { return $script:DeviceNames[$Id] }
+    $name = $null
+    try { $name = Get-DeviceName (Invoke-NinjaApi "/v2/device/$Id") } catch { }
+    if (-not $name) { $name = "Device $Id" }
+    $script:DeviceNames[$Id] = $name
+    $name
 }
 
 # Reads one custom field across all devices, following the query cursor to the end.
@@ -508,8 +534,8 @@ try {
     $script:AccessToken = Get-AccessToken
 
     Write-Host 'Loading devices...'
-    $deviceNames = Get-AllDevices
-    Write-Host "  $($deviceNames.Count) devices"
+    $deviceCount = Get-AllDevices
+    Write-Host "  $deviceCount device name(s) from bulk list (others resolved per device)"
 
     Write-Host "Loading custom field '$DataFieldName' across all devices..."
     $rows = Get-CustomFieldValues -FieldName $DataFieldName
@@ -543,7 +569,8 @@ try {
         if (-not $data) { continue }
 
         $deviceId = Get-RowDeviceId $row
-        $name = if ($deviceId -and $deviceNames.ContainsKey($deviceId)) { $deviceNames[$deviceId] } elseif ($data.host) { [string]$data.host } else { "Device $deviceId" }
+        $name = Resolve-DeviceName $deviceId
+        if ($data.host -and $name -eq "Device $deviceId") { $name = [string]$data.host }
         $device = [pscustomobject]@{ id = $deviceId; name = $name }
         $devicesScanned++
 
