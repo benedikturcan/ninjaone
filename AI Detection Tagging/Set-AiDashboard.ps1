@@ -353,6 +353,47 @@ function New-DeviceList($Devices, [int]$Limit = 15) {
     $html
 }
 
+# NinjaOne WYSIWYG blocks <img> and <svg>, so real product logos are impossible. Instead each tool
+# gets a brand-coloured monogram badge (colour + 1-2 letters) - the closest the sanitizer allows.
+$ToolBrand = @{
+    'Claude Desktop' = @('#D97757', 'C'); 'Claude Code' = @('#D97757', 'CC')
+    'ChatGPT Desktop' = @('#10A37F', 'GPT'); 'Microsoft Copilot' = @('#0A5AFF', 'Co')
+    'Perplexity' = @('#20808D', 'Px'); 'GitHub Copilot' = @('#6E5494', 'GH')
+    'Cursor' = @('#0B0B0B', 'Cu'); 'Windsurf' = @('#09B6A2', 'Ws')
+    'Ollama' = @('#0B0B0B', 'Ol'); 'LM Studio' = @('#4F46E5', 'LM'); 'GPT4All' = @('#1F6FEB', 'G4')
+    'Jan' = @('#2563EB', 'Jn'); 'AnythingLLM' = @('#6D28D9', 'AL')
+    'Text Generation WebUI' = @('#DB2777', 'TG'); 'llama.cpp server' = @('#0EA5E9', 'Lc')
+    'Codeium' = @('#09B6A2', 'Cd'); 'Continue' = @('#334155', 'Ct'); 'Tabnine' = @('#2B7A78', 'Tn')
+    'Sourcegraph Cody' = @('#F94F82', 'Cy'); 'Amazon Q / CodeWhisperer' = @('#FF9900', 'Q')
+    'Supermaven' = @('#8B5CF6', 'Sm'); 'Aider' = @('#22C55E', 'Ai'); 'llm (CLI)' = @('#0EA5E9', 'llm')
+    'ShellGPT' = @('#16A34A', 'sg'); 'Gemini CLI' = @('#1A73E8', 'Ge'); 'Hugging Face CLI' = @('#FFAE1A', 'HF')
+}
+
+function Get-ToolBrand([string]$Name) {
+    if ($ToolBrand.ContainsKey($Name)) { return $ToolBrand[$Name] }
+    $category = Get-ToolCategory $Name
+    $color = if ($CategoryColor.ContainsKey($category)) { $CategoryColor[$category] } else { '#64748b' }
+    $mono = if ($Name.Length -ge 1) { $Name.Substring(0, 1).ToUpper() } else { '?' }
+    @($color, $mono)
+}
+
+# One card per tool: brand badge, name + category, device/running chips, and the devices below.
+function New-ToolCard($Tool) {
+    $brand = Get-ToolBrand $Tool.Name
+    $category = Get-ToolCategory $Tool.Name
+    $badge = '<div style="width:36px;height:36px;border-radius:9px;background-color:{0};color:#ffffff;font-size:13px;font-weight:bold;text-align:center;line-height:36px;">{1}</div>' -f $brand[0], (ConvertTo-HtmlText $brand[1])
+    $deviceChip = New-Chip ("$($Tool.Hits) device" + $(if ($Tool.Hits -eq 1) { '' } else { 's' })) 'info' '0'
+    $runningChip = if ($Tool.Active -gt 0) { New-Chip ("$($Tool.Active) running") 'danger' '0 0 0 6px' } else { New-Chip 'installed only' 'neutral' '0 0 0 6px' }
+    '<div style="border:1px solid #e2e8f0;border-radius:10px;padding:12px;height:100%;box-sizing:border-box;">' +
+    '<div style="display:flex;align-items:center;">' + $badge +
+    ('<div style="margin-left:10px;"><div style="font-size:14px;font-weight:600;">{0}</div><div style="font-size:11px;color:{1};">{2}</div></div>' -f (ConvertTo-HtmlText $Tool.Name), $MutedColor, (ConvertTo-HtmlText $category)) +
+    '</div>' +
+    ('<div style="margin:8px 0 6px;">{0}{1}</div>' -f $deviceChip, $runningChip) +
+    ('<div style="font-size:11px;color:{0};margin-bottom:2px;">Used on</div>' -f $MutedColor) +
+    ('<div style="font-size:12px;line-height:1.7;">{0}</div>' -f (New-DeviceList $Tool.Devices 12)) +
+    '</div>'
+}
+
 function New-DashboardHtml {
     param($Data)
 
@@ -367,31 +408,13 @@ function New-DashboardHtml {
     (New-StatCard $modelSize 'Local model storage') +
     '</div>'
 
-    # --- Tools across the fleet ---
-    $maxCount = 0
-    foreach ($tool in $Data.tools) { if ($tool.Hits -gt $maxCount) { $maxCount = $tool.Hits } }
-    $toolRows = ''
+    # --- Tool cards: one card per tool, brand badge + the devices that use it below ---
+    $cards = ''
     foreach ($tool in ($Data.tools | Sort-Object -Property @{ Expression = 'Hits'; Descending = $true }, @{ Expression = 'Name' })) {
-        $category = Get-ToolCategory $tool.Name
-        $activeChip = if ($tool.Active -gt 0) { New-Chip ("$($tool.Active) running") 'danger' '0' } else { New-Chip 'installed only' 'neutral' '0' }
-        $toolRows += '<tr>' +
-        ('<td style="padding:6px 8px;"><div style="font-size:13px;">{0}</div><div style="font-size:11px;color:{1};">{2}</div></td>' -f (ConvertTo-HtmlText $tool.Name), $MutedColor, (ConvertTo-HtmlText $category)) +
-        ('<td style="padding:6px 8px;width:22%;"><div style="display:flex;align-items:center;"><span style="font-size:13px;width:28px;">{0}</span><div style="flex-grow:1;">{1}</div></div></td>' -f $tool.Hits, (New-Bar $tool.Hits $maxCount $CategoryColor[$category])) +
-        ('<td style="padding:6px 8px;">{0}</td>' -f $activeChip) +
-        ('<td style="padding:6px 8px;font-size:12px;">{0}</td>' -f (New-DeviceList $tool.Devices)) +
-        '</tr>'
+        $cards += '<div class="col-12 col-md-6 col-xl-4" style="margin-bottom:12px;">' + (New-ToolCard $tool) + '</div>'
     }
-    if ($toolRows) {
-        $toolTable = '<table style="width:100%;border-collapse:collapse;"><thead><tr>' +
-        '<th style="text-align:left;padding:6px 8px;width:22%;">Tool</th>' +
-        '<th style="text-align:left;padding:6px 8px;width:22%;">Devices</th>' +
-        '<th style="text-align:left;padding:6px 8px;width:12%;">Status</th>' +
-        '<th style="text-align:left;padding:6px 8px;">On which devices</th>' +
-        '</tr></thead><tbody>' + $toolRows + '</tbody></table>'
-    }
-    else {
-        $toolTable = New-InfoCard 'success' 'fa-circle-check' 'No named AI tools detected' 'No device reported a catalog AI tool.'
-    }
+    if ($cards) { $toolCards = '<div class="row g-3">' + $cards + '</div>' }
+    else { $toolCards = New-InfoCard 'success' 'fa-circle-check' 'No named AI tools detected' 'No device reported a catalog AI tool.' }
 
     # --- By category ---
     $catMax = 0
@@ -461,7 +484,7 @@ function New-DashboardHtml {
     '<div>' +
     (New-InfoCard '' 'fa-robot' 'AI Detection Dashboard' ("Generated $((Get-Date).ToString('dd.MM.yyyy HH:mm:ss')) from {0} device(s) reporting via '{1}'." -f $Data.devicesScanned, (ConvertTo-HtmlText $DataFieldName))) +
     $stats +
-    (New-FullWidthCard '<i class="fa-solid fa-list-check"></i>&nbsp;AI tools across the fleet' $toolTable) +
+    (New-FullWidthCard '<i class="fa-solid fa-robot"></i>&nbsp;AI tools by device' $toolCards) +
     '<div class="row g-3">' +
     ('<div class="col-12 col-xl-6">{0}</div>' -f (New-FullWidthCard '<i class="fa-solid fa-layer-group"></i>&nbsp;By category' $categoryCard)) +
     ('<div class="col-12 col-xl-6">{0}</div>' -f (New-FullWidthCard '<i class="fa-solid fa-triangle-exclamation"></i>&nbsp;Shadow-AI signals' $shadow)) +
