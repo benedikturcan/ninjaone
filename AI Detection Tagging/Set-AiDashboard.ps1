@@ -601,13 +601,14 @@ function New-DashboardHtml {
     foreach ($name in $CategoryOrder) {
         if (-not $Data.categories.ContainsKey($name)) { continue }
         $count = $Data.categories[$name].Hits
-        $catRows += '<div style="display:flex;align-items:center;margin-bottom:6px;">' +
-        ('<div style="width:130px;font-size:12px;">{0}</div>' -f (ConvertTo-HtmlText $name)) +
-        ('<div style="width:34px;font-size:13px;">{0}</div>' -f $count) +
-        ('<div style="flex-grow:1;">{0}</div>' -f (New-Bar $count $catMax $CategoryColor[$name])) +
-        '</div>'
+        # A table row renders reliably in WYSIWYG; the bar sits in the last (auto-width) cell
+        $catRows += '<tr>' +
+        ('<td style="width:150px;font-size:12px;padding:3px 8px 3px 0;vertical-align:middle;">{0}</td>' -f (ConvertTo-HtmlText $name)) +
+        ('<td style="width:30px;font-size:13px;padding:3px 8px;vertical-align:middle;">{0}</td>' -f $count) +
+        ('<td style="padding:3px 0;vertical-align:middle;">{0}</td>' -f (New-Bar $count $catMax $CategoryColor[$name])) +
+        '</tr>'
     }
-    $categoryCard = if ($catRows) { $catRows } else { '<span style="color:{0};font-size:12px;">No categories.</span>' -f $MutedColor }
+    $categoryCard = if ($catRows) { '<table style="width:100%;border-collapse:collapse;"><tbody>' + $catRows + '</tbody></table>' } else { '<span style="color:{0};font-size:12px;">No categories.</span>' -f $MutedColor }
 
     # --- Shadow-AI signals: local LLM servers and ML runtimes loaded ---
     $shadow = ''
