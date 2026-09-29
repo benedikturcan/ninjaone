@@ -739,6 +739,85 @@ function Get-PkgDetections {
 
 #endregion
 
+#region JSON (5.1-hard, no ConvertTo-Json)
+
+# Built by hand so the output does not depend on Windows PowerShell 5.1 ConvertTo-Json behaviour
+# (single-element arrays unwrapping to objects, default -Depth of 2, culture-dependent numbers).
+# Arrays are always arrays, numbers are invariant, strings are escaped incl. non-ASCII as \uXXXX.
+
+function ConvertTo-JsonString([string]$Text) {
+    if ($null -eq $Text) { return '""' }
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('"')
+    foreach ($ch in $Text.ToCharArray()) {
+        $code = [int]$ch
+        switch ($ch) {
+            '"' { [void]$sb.Append('\"'); continue }
+            '\' { [void]$sb.Append('\\'); continue }
+            "`b" { [void]$sb.Append('\b'); continue }
+            "`f" { [void]$sb.Append('\f'); continue }
+            "`n" { [void]$sb.Append('\n'); continue }
+            "`r" { [void]$sb.Append('\r'); continue }
+            "`t" { [void]$sb.Append('\t'); continue }
+        }
+        if ($code -lt 32 -or $code -gt 126) { [void]$sb.Append('\u'); [void]$sb.Append($code.ToString('x4')) }
+        else { [void]$sb.Append($ch) }
+    }
+    [void]$sb.Append('"')
+    $sb.ToString()
+}
+
+function ConvertTo-JsonStringArray($Items) {
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($item in $Items) { $parts.Add((ConvertTo-JsonString ([string]$item))) }
+    '[' + ($parts -join ',') + ']'
+}
+
+function Format-JsonInt($Value) { ([long]$Value).ToString([Globalization.CultureInfo]::InvariantCulture) }
+
+function New-AiDataJson {
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.Append('{"v":1')
+    [void]$sb.Append(',"host":' + (ConvertTo-JsonString ([string]$env:COMPUTERNAME)))
+    [void]$sb.Append(',"at":' + (ConvertTo-JsonString ((Get-Date).ToUniversalTime().ToString('o'))))
+
+    # tools: [{ "n": name, "e": [evidence], "a": active }]
+    $toolParts = New-Object System.Collections.Generic.List[string]
+    foreach ($tool in $script:DataTools) {
+        $active = if ($tool.a) { 'true' } else { 'false' }
+        $toolParts.Add('{"n":' + (ConvertTo-JsonString ([string]$tool.n)) +
+            ',"e":' + (ConvertTo-JsonStringArray $tool.e) + ',"a":' + $active + '}')
+    }
+    [void]$sb.Append(',"tools":[' + ($toolParts -join ',') + ']')
+
+    # models: [{ "label": label, "bytes": n }]
+    $modelParts = New-Object System.Collections.Generic.List[string]
+    foreach ($label in ($script:DataModels.Keys | Sort-Object)) {
+        $modelParts.Add('{"label":' + (ConvertTo-JsonString ([string]$label)) +
+            ',"bytes":' + (Format-JsonInt $script:DataModels[$label]) + '}')
+    }
+    [void]$sb.Append(',"models":[' + ($modelParts -join ',') + ']')
+
+    # modelFiles: { "count": n, "bytes": n, "exts": [..] } or null
+    if ($script:DataModelScan) {
+        [void]$sb.Append(',"modelFiles":{"count":' + (Format-JsonInt $script:DataModelScan.count) +
+            ',"bytes":' + (Format-JsonInt $script:DataModelScan.bytes) +
+            ',"exts":' + (ConvertTo-JsonStringArray $script:DataModelScan.exts) + '}')
+    }
+    else {
+        [void]$sb.Append(',"modelFiles":null')
+    }
+
+    [void]$sb.Append(',"apiKeys":' + (ConvertTo-JsonStringArray $script:DataApiKeys))
+    [void]$sb.Append(',"packages":' + (ConvertTo-JsonStringArray $script:DataPackages))
+    [void]$sb.Append(',"mldll":' + (ConvertTo-JsonStringArray $script:DataMlDll))
+    [void]$sb.Append(',"apiServers":' + (ConvertTo-JsonStringArray $script:DataApiServers))
+    [void]$sb.Append('}')
+    $sb.ToString()
+}
+
+#endregion
+
 #region Custom field
 
 function Set-NinjaCustomField([string]$Name, [string]$Value) {
@@ -842,30 +921,11 @@ try {
     # A multi-line value would break the log into several lines, so show it on one
     $logValue = $fieldValue -replace '\r?\n', ' | '
 
-    # Machine-readable JSON of the same findings, for the central dashboard to aggregate
+    # Machine-readable JSON of the same findings, for the central dashboard to aggregate.
+    # Built by hand (see the JSON region) so it does not depend on 5.1 ConvertTo-Json behaviour.
     $DataFieldName = "$DataFieldName".Trim()
     $json = $null
-    if ($DataFieldName) {
-        $modelList = @()
-        foreach ($label in ($script:DataModels.Keys | Sort-Object)) {
-            $modelList += [pscustomobject]@{ label = $label; bytes = $script:DataModels[$label] }
-        }
-        # Do NOT wrap the List[object]/List[string] accumulators in @(): @() on a List[object] throws
-        # "Argument types do not match" in PowerShell. ConvertTo-Json serialises the lists as arrays.
-        $aiData = [ordered]@{
-            v          = 1
-            host       = $env:COMPUTERNAME
-            at         = (Get-Date).ToUniversalTime().ToString('o')
-            tools      = $script:DataTools
-            models     = @($modelList)
-            modelFiles = $script:DataModelScan
-            apiKeys    = $script:DataApiKeys
-            packages   = $script:DataPackages
-            mldll      = $script:DataMlDll
-            apiServers = $script:DataApiServers
-        }
-        $json = ConvertTo-Json -InputObject $aiData -Depth 6 -Compress
-    }
+    if ($DataFieldName) { $json = New-AiDataJson }
 
     if ($DryRun) {
         Write-Log ('Dry run: custom field "{0}" would be set to "{1}"' -f $CustomFieldName, $logValue)
