@@ -114,14 +114,27 @@ function Set-GlobalCustomField {
 function Get-AllDevices {
     $devices = @{}
     $after = 0
-    do {
+    while ($true) {
         $batch = @(Invoke-NinjaApi ("/v2/devices?pageSize=1000&after={0}" -f $after))
+        if ($batch.Count -eq 0) { break }
         foreach ($device in $batch) {
-            $name = if ($device.displayName) { $device.displayName } elseif ($device.systemName) { $device.systemName } else { "Device $($device.id)" }
-            $devices[[string]$device.id] = $name
+            if ($null -eq $device) { continue }
+            $id = "$($device.id)"
+            if (-not $id) { continue }
+            $name = if ($device.displayName) { "$($device.displayName)" }
+            elseif ($device.systemName) { "$($device.systemName)" }
+            else { "Device $id" }
+            $devices[$id] = $name
         }
-        if ($batch.Count -gt 0) { $after = [int]$batch[$batch.Count - 1].id }
-    } while ($batch.Count -eq 1000)
+        # Cursor is the last device id. Parse defensively (no [int] cast that can throw on odd shapes)
+        # and stop when the page is short or the cursor does not advance, so we never loop forever.
+        if ($batch.Count -lt 1000) { break }
+        $lastId = [int64]0
+        $last = $batch | Select-Object -Last 1
+        if ($last) { [void][int64]::TryParse("$($last.id)", [ref]$lastId) }
+        if ($lastId -le $after) { break }
+        $after = $lastId
+    }
     $devices
 }
 
