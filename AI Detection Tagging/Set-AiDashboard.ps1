@@ -379,6 +379,15 @@ function New-DeviceList($Devices, [int]$Limit = 15) {
     $html
 }
 
+# One line per device with its detail (e.g. the exposed port / the loaded runtime) after the name
+function New-DetailDeviceList($Devices) {
+    $parts = foreach ($device in ($Devices | Sort-Object { $_.name })) {
+        $detail = if ($device.detail) { ' <span style="color:{0};">- {1}</span>' -f $MutedColor, (ConvertTo-HtmlText $device.detail) } else { '' }
+        '<div style="margin:2px 0;">' + (New-DeviceLink $device.id $device.name) + $detail + '</div>'
+    }
+    ($parts -join '')
+}
+
 # NinjaOne WYSIWYG blocks <img> and <svg>, so real product logos are impossible. Instead each tool
 # gets a brand-coloured monogram badge (colour + 1-2 letters) - the closest the sanitizer allows.
 $ToolBrand = @{
@@ -463,11 +472,11 @@ function New-DashboardHtml {
     # not match" in PowerShell. List objects have their own .Count and enumerate fine in pipelines.
     if ($Data.serverDevices.Count -gt 0) {
         $shadow += (New-InfoCard 'warning' 'fa-server' 'Local LLM servers responding' ('{0} device(s) expose an LLM API on localhost.' -f $Data.serverDevices.Count))
-        $shadow += '<div style="font-size:12px;margin:0 0 12px;">{0}</div>' -f (New-DeviceList $Data.serverDevices 30)
+        $shadow += '<div style="font-size:12px;margin:0 0 12px;">{0}</div>' -f (New-DetailDeviceList $Data.serverDevices)
     }
     if ($Data.mldllDevices.Count -gt 0) {
         $shadow += (New-InfoCard 'warning' 'fa-microchip' 'ML runtime loaded (unidentified)' ('{0} device(s) run a process with an ML runtime that is not a named tool.' -f $Data.mldllDevices.Count))
-        $shadow += '<div style="font-size:12px;margin:0 0 4px;">{0}</div>' -f (New-DeviceList $Data.mldllDevices 30)
+        $shadow += '<div style="font-size:12px;margin:0 0 4px;">{0}</div>' -f (New-DetailDeviceList $Data.mldllDevices)
     }
     if (-not $shadow) { $shadow = New-InfoCard 'success' 'fa-circle-check' 'No unidentified local AI' 'No local LLM servers or unnamed ML runtimes were found.' }
 
@@ -610,8 +619,19 @@ try {
             $packages[$pkgName].Devices.Add($device)
         }
 
-        if ((ConvertTo-Array $data.apiServers).Count -gt 0) { $hasAi = $true; $isActive = $true; $serverDevices.Add($device) }
-        if ((ConvertTo-Array $data.mldll).Count -gt 0) { $hasAi = $true; $mldllDevices.Add($device) }
+        $serverArr = ConvertTo-Array $data.apiServers
+        if ($serverArr.Count -gt 0) {
+            $hasAi = $true; $isActive = $true
+            # detail e.g. "OpenAI-compatible API, port 8000" - strip the "Local LLM server (...)" wrapper from the text form
+            $detail = (@($serverArr | ForEach-Object { ($_ -replace '^Local LLM server \(', '') -replace '\)\s*$', '' }) -join '; ')
+            $serverDevices.Add([pscustomobject]@{ id = $deviceId; name = $name; detail = $detail })
+        }
+        $mldllArr = ConvertTo-Array $data.mldll
+        if ($mldllArr.Count -gt 0) {
+            $hasAi = $true
+            $detail = (@($mldllArr | ForEach-Object { [string]$_ }) -join '; ')
+            $mldllDevices.Add([pscustomobject]@{ id = $deviceId; name = $name; detail = $detail })
+        }
 
         [double]$deviceBytes = 0
         foreach ($model in (ConvertTo-Array $data.models)) { $deviceBytes += [double]$model.bytes }
