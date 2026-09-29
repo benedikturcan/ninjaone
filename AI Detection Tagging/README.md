@@ -187,10 +187,25 @@ The central component. It runs on **one** device (or on a schedule), authenticat
 ### What the dashboard shows
 - **KPI cards:** devices scanned, devices with AI, distinct AI tools, devices running AI *now*, devices with API keys, total local model storage across the fleet.
 - **AI tools by device (cards):** one card per tool with a brand-coloured badge, the *installed vs. running* status, the device count, and **which devices use it** listed below (linked). NinjaOne WYSIWYG blocks `<img>` and `<svg>`, so real product logos are not possible - the badge is a brand-coloured monogram (e.g. terracotta "C" for Claude), the closest the sanitizer allows.
-- **By category:** local runtime / desktop app / AI editor / coding assistant / CLI.
+- **By category:** the **named catalog tools** grouped by category (see below).
+- **AI condition activity (NinjaOne):** condition triggers pulled from `/v2/activities` - Device / Event ID / Time / Message (see [Windows Event Log](#windows-event-log-optional)).
 - **Shadow-AI signals:** devices exposing a local LLM API and devices running an unidentified ML runtime.
 - **AI API keys by provider** and **AI SDKs (pip/npm) by package**, each with the device list.
 - **Local model storage by device.**
+
+#### "By category" - what it counts
+This card groups the **named catalog tools** by category, counting **devices per category** (a device counts once per category). Only categories that were actually detected are shown, so with only ChatGPT/Claude Desktop present you see just *Desktop app*.
+
+| Category | Example tools |
+| --- | --- |
+| Local runtime | Ollama, LM Studio, GPT4All, Jan, AnythingLLM, llama.cpp |
+| Desktop app | ChatGPT Desktop, Claude Desktop, Microsoft Copilot, Perplexity |
+| AI editor | Cursor, Windsurf |
+| Coding assistant | GitHub Copilot, Codeium, Continue, Tabnine, Sourcegraph Cody, Amazon Q, Supermaven |
+| CLI | Claude Code, Aider, llm, ShellGPT, Gemini CLI, Hugging Face CLI |
+| Other | any tool not mapped above |
+
+**Not counted here** (these are generic signals, not named tools - they have their own cards): unidentified local LLM servers and ML runtimes (*Shadow-AI signals*), AI API keys (*AI API keys by provider*), pip/npm SDKs (*AI SDKs*), and model files (*Local model storage*). So a fake/unnamed LLM server or an installed SDK will **not** appear in "By category" - only a named tool like Ollama or Cursor will.
 
 ### Data sources (public API, client credentials)
 ```
