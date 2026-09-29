@@ -283,7 +283,11 @@ function ConvertFrom-AiTagText([string]$Text) {
         }
         # "Local model files: 2 file(s), 230 MB (.gguf, .safetensors)"
         if ($l -like 'Local model files:*') {
-            $modelFiles = [pscustomobject]@{ count = 0; bytes = (ConvertFrom-SizeText $l); exts = @() }
+            $count = 0; if ($l -match '(\d+)\s*file') { $count = [int]$Matches[1] }
+            $exts = @()
+            $mx = [regex]::Match($l, '\(([^)]*)\)\s*$')
+            if ($mx.Success) { $exts = @(($mx.Groups[1].Value -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+            $modelFiles = [pscustomobject]@{ count = $count; bytes = (ConvertFrom-SizeText $l); exts = $exts }
             continue
         }
         # Otherwise a tool line: "Name (evidence, evidence)"
@@ -535,11 +539,18 @@ function New-DashboardHtml {
     # --- Model storage by device ---
     $modelRows = ''
     foreach ($device in ($Data.modelDevices | Sort-Object { -$_.bytes } | Select-Object -First 25)) {
-        $modelRows += '<tr><td style="padding:5px 8px;font-size:13px;">{0}</td><td style="padding:5px 8px;font-size:12px;">{1}</td></tr>' -f (New-DeviceLink $device.id $device.name), (Format-Size $device.bytes)
+        $detailParts = @()
+        if ($device.files -gt 0) { $detailParts += ('{0} file(s)' -f $device.files) }
+        if ($device.dirs -gt 0) { $detailParts += ('{0} model dir(s)' -f $device.dirs) }
+        $extList = @($device.exts)
+        $extText = if ($extList.Count -gt 0) { ' (' + ((@($extList | ForEach-Object { ConvertTo-HtmlText $_ })) -join ', ') + ')' } else { '' }
+        $detail = ($detailParts -join ', ') + $extText
+        $detailHtml = if ($detail.Trim()) { '<div style="font-size:11px;color:{0};">{1}</div>' -f $MutedColor, $detail } else { '' }
+        $modelRows += '<tr><td style="padding:5px 8px;font-size:13px;vertical-align:top;">{0}</td><td style="padding:5px 8px;font-size:12px;vertical-align:top;">{1}{2}</td></tr>' -f (New-DeviceLink $device.id $device.name), (Format-Size $device.bytes), $detailHtml
     }
     $modelCard = if ($modelRows) {
         ('<div style="font-size:12px;color:{0};margin-bottom:8px;">Total across the fleet: {1}</div>' -f $MutedColor, $modelSize) +
-        '<table style="width:100%;border-collapse:collapse;"><thead><tr><th style="text-align:left;padding:6px 8px;">Device</th><th style="text-align:left;padding:6px 8px;width:20%;">Model storage</th></tr></thead><tbody>' + $modelRows + '</tbody></table>'
+        '<table style="width:100%;border-collapse:collapse;"><thead><tr><th style="text-align:left;padding:6px 8px;">Device</th><th style="text-align:left;padding:6px 8px;width:30%;">Model storage</th></tr></thead><tbody>' + $modelRows + '</tbody></table>'
     }
     else { New-InfoCard 'success' 'fa-circle-check' 'No local model files' 'No device stores local model weight files.' }
 
@@ -662,12 +673,18 @@ try {
         }
 
         [double]$deviceBytes = 0
-        foreach ($model in (ConvertTo-Array $data.models)) { $deviceBytes += [double]$model.bytes }
-        if ($data.modelFiles -and $data.modelFiles.bytes) { $deviceBytes += [double]$data.modelFiles.bytes }
+        $dirCount = 0
+        foreach ($model in (ConvertTo-Array $data.models)) { $deviceBytes += [double]$model.bytes; $dirCount++ }
+        $fileCount = 0; $exts = @()
+        if ($data.modelFiles) {
+            if ($data.modelFiles.bytes) { $deviceBytes += [double]$data.modelFiles.bytes }
+            if ($data.modelFiles.count) { $fileCount = [int]$data.modelFiles.count }
+            $exts = @(ConvertTo-Array $data.modelFiles.exts)
+        }
         if ($deviceBytes -gt 0) {
             $hasAi = $true
             $totalModelBytes += $deviceBytes
-            $modelDevices.Add([pscustomobject]@{ id = $deviceId; name = $name; bytes = $deviceBytes })
+            $modelDevices.Add([pscustomobject]@{ id = $deviceId; name = $name; bytes = $deviceBytes; files = $fileCount; dirs = $dirCount; exts = $exts })
         }
 
         if ($hasAi) { $devicesWithAi++ }
