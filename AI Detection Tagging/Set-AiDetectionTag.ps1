@@ -64,6 +64,12 @@
                            empty on devices where you only want the human-readable tag.
         disabledVectors    Optional: comma/space separated list of vectors to skip
                            (software, process, service, port, artifact, ide, cli, env)
+        writeEventLog      Optional: 'true' to also write Windows events (source 'NinjaAIDetection'
+                           in the Application log) so detections are traceable and NinjaOne / SIEM
+                           can alert on them. Off unless set. Events are written on change (a local
+                           cache prevents a scheduled run from re-logging unchanged findings), plus
+                           one summary event per run. Event IDs: 5000 summary, 5001 local LLM server,
+                           5002 unidentified ML runtime, 5003 API key, 5004 named tool, 5010 cleared.
 
     Two-component design:
         1. This script runs per device (agent, as SYSTEM) and writes both the human-readable tag
@@ -95,6 +101,7 @@ param(
     [string]$CustomFieldName = $env:customFieldName,
     [string]$DataFieldName = $env:dataFieldName,
     [string]$DisabledVectors = $env:disabledVectors,
+    [string]$WriteEventLog = $env:writeEventLog,
     [switch]$DryRun
 )
 
@@ -109,6 +116,12 @@ $NoMatchValue = ''                       # written when nothing is found, empty 
 $MaxLength = 10000                       # length limit of the custom field (single-line text: 255)
 $RequireServiceRunning = $false          # $true: a service only counts while it is running
 $MinModelBytes = 50MB                    # a model directory is only reported above this size
+
+# Windows Event Log (only used when the 'writeEventLog' variable is enabled)
+$EventSource = 'NinjaAIDetection'        # event source, created once in the Application log
+$EventLogName = 'Application'
+$EventCacheDir = if ($env:NINJA_DATA_PATH) { $env:NINJA_DATA_PATH } elseif ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$EventCachePath = Join-Path $EventCacheDir 'ai-detection-events-cache.json'
 
 #endregion
 
@@ -818,6 +831,100 @@ function New-AiDataJson {
 
 #endregion
 
+#region Event log
+
+# Event ID scheme (documented in the README - keep stable, SIEM / NinjaOne conditions build on it):
+#   5000 Information  scan summary (every run)
+#   5001 Warning      local LLM server detected (new)
+#   5002 Warning      unidentified ML runtime loaded (new)
+#   5003 Warning      AI API key present in environment (new)
+#   5004 Information   named AI tool detected (new)
+#   5010 Information   an AI signal from a previous run is no longer present (cleared)
+
+function Test-Truthy([string]$Value) {
+    if (-not $Value) { return $false }
+    @('1', 'true', 'yes', 'on', 'enabled') -contains $Value.Trim().ToLowerInvariant()
+}
+
+# The current run's signals, each a stable key (for change detection) plus its event id/level/message
+function Get-AiSignals {
+    $signals = New-Object System.Collections.Generic.List[object]
+    foreach ($tool in $script:DataTools) {
+        $evidence = ''
+        try { $evidence = (@($tool.e) -join ', ') } catch { }
+        $signals.Add([pscustomobject]@{ key = "tool:$($tool.n)"; id = 5004; level = 'Information'; message = "AI tool detected: $($tool.n) ($evidence)" })
+    }
+    foreach ($server in $script:DataApiServers) {
+        $signals.Add([pscustomobject]@{ key = "server:$server"; id = 5001; level = 'Warning'; message = "Local LLM server detected: $server" })
+    }
+    foreach ($runtime in $script:DataMlDll) {
+        $signals.Add([pscustomobject]@{ key = "mldll:$runtime"; id = 5002; level = 'Warning'; message = "Unidentified ML runtime loaded: $runtime" })
+    }
+    foreach ($key in $script:DataApiKeys) {
+        $signals.Add([pscustomobject]@{ key = "apikey:$key"; id = 5003; level = 'Warning'; message = "AI API key present in environment: $key" })
+    }
+    $signals
+}
+
+function Get-EventCache {
+    if (-not (Test-Path -Path $EventCachePath)) { return @() }
+    try { @(([IO.File]::ReadAllText($EventCachePath, [Text.Encoding]::UTF8) | ConvertFrom-Json)) }
+    catch { @() }
+}
+
+function Save-EventCache($Keys) {
+    try { [IO.File]::WriteAllText($EventCachePath, (ConvertTo-JsonStringArray $Keys), (New-Object Text.UTF8Encoding($false))) }
+    catch { Write-Log ('  Warning: could not write event cache ({0})' -f $_.Exception.Message) }
+}
+
+# Creates the event source on first use (needs admin; the agent runs as SYSTEM). Returns $true if usable.
+function Initialize-EventSource {
+    try {
+        if (-not [System.Diagnostics.EventLog]::SourceExists($EventSource)) {
+            [System.Diagnostics.EventLog]::CreateEventSource($EventSource, $EventLogName)
+            Write-Log ('  Event source "{0}" created in the {1} log' -f $EventSource, $EventLogName)
+        }
+        $true
+    }
+    catch {
+        Write-Log ('  Warning: event logging unavailable ({0}). Creating the source once needs admin rights.' -f $_.Exception.Message)
+        $false
+    }
+}
+
+function Write-AiEvent([int]$EventId, [string]$Level, [string]$Message) {
+    try { Write-EventLog -LogName $EventLogName -Source $EventSource -EventId $EventId -EntryType $Level -Message $Message -ErrorAction Stop }
+    catch { Write-Log ('  Warning: could not write event {0} ({1})' -f $EventId, $_.Exception.Message) }
+}
+
+# Emits the summary event, one event per NEW signal, and a cleared event per signal that disappeared.
+# A local cache of the previous run's keys keeps a scheduled run from re-logging unchanged findings.
+function Invoke-EventLogging([bool]$IsDryRun) {
+    $signals = @(Get-AiSignals)
+    $currentKeys = @($signals | ForEach-Object { $_.key })
+    $previousKeys = @(Get-EventCache)
+
+    $newSignals = @($signals | Where-Object { $previousKeys -notcontains $_.key })
+    $clearedKeys = @($previousKeys | Where-Object { $currentKeys -notcontains $_ })
+
+    $summary = 'AI scan on {0}: {1} tool(s), {2} local LLM server(s), {3} API key(s), {4} unidentified ML runtime(s). {5} new, {6} cleared since last run.' -f `
+        $env:COMPUTERNAME, $script:DataTools.Count, $script:DataApiServers.Count, $script:DataApiKeys.Count, $script:DataMlDll.Count, $newSignals.Count, $clearedKeys.Count
+
+    if ($IsDryRun) {
+        Write-Log ('Dry run: would write event 5000 (summary) + {0} new + {1} cleared event(s)' -f $newSignals.Count, $clearedKeys.Count)
+        return
+    }
+
+    Write-AiEvent 5000 'Information' $summary
+    foreach ($signal in $newSignals) { Write-AiEvent $signal.id $signal.level $signal.message }
+    foreach ($clearedKey in $clearedKeys) { Write-AiEvent 5010 'Information' ("AI signal no longer present: $clearedKey") }
+
+    Save-EventCache $currentKeys
+    Write-Log ('Event log: summary + {0} new + {1} cleared event(s) written (source "{2}")' -f $newSignals.Count, $clearedKeys.Count, $EventSource)
+}
+
+#endregion
+
 #region Custom field
 
 function Set-NinjaCustomField([string]$Name, [string]$Value) {
@@ -927,9 +1034,12 @@ try {
     $json = $null
     if ($DataFieldName) { $json = New-AiDataJson }
 
+    $writeEvents = Test-Truthy $WriteEventLog
+
     if ($DryRun) {
         Write-Log ('Dry run: custom field "{0}" would be set to "{1}"' -f $CustomFieldName, $logValue)
         if ($DataFieldName) { Write-Log ('Dry run: data field "{0}" would be set to {1} characters of JSON' -f $DataFieldName, $json.Length) }
+        if ($writeEvents) { Invoke-EventLogging $true }
         exit 0
     }
 
@@ -945,6 +1055,8 @@ try {
         Set-NinjaCustomField -Name $DataFieldName -Value $json | Out-Null
         Write-Log ('Data field "{0}" set ({1} characters of JSON)' -f $DataFieldName, $json.Length)
     }
+
+    if ($writeEvents -and (Initialize-EventSource)) { Invoke-EventLogging $false }
 
     exit 0
 } catch {
