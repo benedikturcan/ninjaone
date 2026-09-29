@@ -138,17 +138,34 @@ function Get-AllDevices {
     $devices
 }
 
-# Reads one custom field across all devices, following the query cursor to the end
+# Reads one custom field across all devices, following the query cursor to the end.
+# Logs the response shape on the first page and handles results / devices / bare-array shapes, so a
+# 0-row result is diagnosable (usually the field lacks API-read permission or the name is wrong).
 function Get-CustomFieldValues {
     param([string]$FieldName)
     $rows = New-Object System.Collections.Generic.List[object]
     $cursor = $null
+    $first = $true
     do {
         $endpoint = "/v2/queries/custom-fields?fields=$FieldName"
         if ($cursor) { $endpoint += "&cursor=$cursor" }
         $response = Invoke-NinjaApi $endpoint
-        foreach ($result in @($response.results)) { $rows.Add($result) }
-        $cursor = if ($response.PSObject.Properties['cursor'] -and $response.cursor) { [string]$response.cursor.name } else { $null }
+
+        if ($first) {
+            $keys = if ($response) { ($response.PSObject.Properties.Name) -join ', ' } else { '(null)' }
+            Write-Host "  query response fields: $keys"
+            $first = $false
+        }
+
+        $items = @()
+        if ($null -eq $response) { $items = @() }
+        elseif ($response.PSObject.Properties['results']) { $items = @($response.results) }
+        elseif ($response.PSObject.Properties['devices']) { $items = @($response.devices) }
+        elseif ($response -is [System.Collections.IEnumerable] -and $response -isnot [string]) { $items = @($response) }
+        else { $items = @($response) }
+        foreach ($result in $items) { if ($null -ne $result) { $rows.Add($result) } }
+
+        $cursor = if ($response -and $response.PSObject.Properties['cursor'] -and $response.cursor) { [string]$response.cursor.name } else { $null }
     } while ($cursor)
     $rows
 }
@@ -177,11 +194,60 @@ function Get-RowDeviceId($Row) {
     $null
 }
 
-# @($null).Count is 1 in PowerShell, so a missing JSON array would iterate once on $null.
-# This returns an empty array for null and a real array otherwise.
+# @($null).Count is 1 in PowerShell, and @() on a List[object] throws. This returns an empty array
+# for null, enumerates any collection (List/array) safely, and wraps a single object as one element.
 function ConvertTo-Array($Value) {
     if ($null -eq $Value) { return @() }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $out = New-Object System.Collections.Generic.List[object]
+        foreach ($item in $Value) { $out.Add($item) }
+        return $out.ToArray()
+    }
     @($Value)
+}
+
+# Fallback for the human-readable tag field (e.g. "AI Tag"): turn its lines back into the same shape
+# as the JSON, so the dashboard works even when only the human-readable field is populated / readable.
+function ConvertFrom-AiTagText([string]$Text) {
+    $tools = New-Object System.Collections.Generic.List[object]
+    $apiKeys = New-Object System.Collections.Generic.List[string]
+    $packages = New-Object System.Collections.Generic.List[string]
+    $mldll = New-Object System.Collections.Generic.List[string]
+    $apiServers = New-Object System.Collections.Generic.List[string]
+
+    foreach ($line in ($Text -split '\r?\n')) {
+        $l = $line.Trim()
+        if (-not $l) { continue }
+        if ($l -like 'AI API keys in environment:*') {
+            foreach ($k in ($l.Substring($l.IndexOf(':') + 1) -split ',')) { $t = $k.Trim(); if ($t) { $apiKeys.Add($t) } }
+            continue
+        }
+        if ($l -like 'AI SDKs installed:*') {
+            foreach ($p in ($l.Substring($l.IndexOf(':') + 1) -split ',')) { $t = $p.Trim(); if ($t) { $packages.Add($t) } }
+            continue
+        }
+        if ($l -like 'Possible local AI*:*') {
+            foreach ($m in ($l.Substring($l.IndexOf(':') + 1) -split ',')) { $t = $m.Trim(); if ($t) { $mldll.Add($t) } }
+            continue
+        }
+        if ($l -like 'Local LLM server*') { $apiServers.Add($l); continue }
+        if ($l -like 'Local AI models:*' -or $l -like 'Local model files:*') { continue }  # no reliable byte count from text
+        # Otherwise a tool line: "Name (evidence, evidence)"
+        $name = $l; $evidence = ''
+        $paren = $l.IndexOf(' (')
+        if ($paren -gt 0 -and $l.EndsWith(')')) {
+            $name = $l.Substring(0, $paren).Trim()
+            $evidence = $l.Substring($paren + 2, $l.Length - $paren - 3)
+        }
+        if (-not $name) { continue }
+        $active = ($evidence -match '(?i)\brunning\b') -or ($evidence -match '(?i)\bport\s+\d+')
+        $tools.Add([pscustomobject]@{ n = $name; a = $active })
+    }
+
+    [pscustomobject]@{
+        tools = $tools; apiKeys = $apiKeys; packages = $packages; mldll = $mldll
+        apiServers = $apiServers; models = @(); modelFiles = $null; host = $null
+    }
 }
 
 #endregion
@@ -438,11 +504,19 @@ try {
     [double]$totalModelBytes = 0
     $categorySeen = @{}   # "category|deviceId" -> 1, so a device counts once per category
 
+    $parseErrors = 0
     foreach ($row in $rows) {
         $raw = Get-RowFieldValue $row $DataFieldName
+        if ($raw -is [string]) { $raw = $raw.Trim() }
         if (-not $raw) { continue }
         $data = $null
-        try { $data = $raw | ConvertFrom-Json } catch { continue }
+        # JSON from the aiData field, or the human-readable aiTag text as a fallback
+        if ("$raw".StartsWith('{')) {
+            try { $data = $raw | ConvertFrom-Json } catch { $parseErrors++; continue }
+        }
+        else {
+            $data = ConvertFrom-AiTagText ([string]$raw)
+        }
         if (-not $data) { continue }
 
         $deviceId = Get-RowDeviceId $row
@@ -520,7 +594,17 @@ try {
         modelDevices    = $modelDevices
     }
 
-    Write-Host "Aggregated: $devicesWithAi of $devicesScanned devices with AI, $($toolList.Count) distinct tools"
+    Write-Host "Aggregated: $devicesWithAi of $devicesScanned devices with AI, $($toolList.Count) distinct tools ($parseErrors unparseable value(s))"
+
+    if (@($rows).Count -eq 0) {
+        Write-Host "HINT: 0 rows from /v2/queries/custom-fields for field '$DataFieldName'. Check that the field's"
+        Write-Host "      machine name is exactly '$DataFieldName' and that its API permission is Read (or Read/Write)."
+        Write-Host "      Global fields are not returned here; use a per-device (role) custom field."
+    }
+    elseif ($devicesScanned -eq 0) {
+        Write-Host "HINT: rows returned but no value could be read for field '$DataFieldName'. The value may sit under a"
+        Write-Host "      different property than expected - see 'query response fields' above."
+    }
 
     $html = New-DashboardHtml -Data $aggregate
     Write-Host "Writing dashboard to global custom field `"$DashboardFieldName`" ($($html.Length) characters)..."
