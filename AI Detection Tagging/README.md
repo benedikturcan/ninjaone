@@ -1,8 +1,15 @@
 # NinjaOne AI Detection Tagging
 
-Answer the recurring customer question *"can we tell from the endpoint whether AI is installed or running?"* - surface **shadow AI** on a device (local LLM runtimes, AI desktop apps, coding-assistant integrations, AI CLIs, model files, AI API keys) into a **Multi-line text custom field**.
+Answer the recurring customer question *"can we tell from the endpoint whether AI is installed or running?"* - surface **shadow AI** on a device (local LLM runtimes, AI desktop apps, coding-assistant integrations, AI CLIs, model files, AI API keys) into custom fields, and roll it up into **one fleet-wide dashboard**.
 
-One PowerShell script: [`Set-AiDetectionTag.ps1`](Set-AiDetectionTag.ps1). Windows PowerShell 5.1, ASCII-only, read-only inventory (**never** `Win32_Product`), `Ninja-Property-Set`, `-DryRun`, exit `0` / `1`. It only writes the one custom field it is pointed at; everything else it does is read-only. It does **not** change the NinjaOne device role.
+Two components:
+
+| Script | Runs | Writes | Purpose |
+| --- | --- | --- | --- |
+| [`Set-AiDetectionTag.ps1`](Set-AiDetectionTag.ps1) | per device (agent, SYSTEM) | device fields `aiTag` (human-readable) + `aiData` (JSON) | deep local detection - the rich per-device signals |
+| [`Set-AiDashboard.ps1`](Set-AiDashboard.ps1) | centrally on one device (API) | global WYSIWYG field `aiDashboard` | reads every device's `aiData` and renders the fleet dashboard |
+
+Why two: an agent script only sees **its own** device. A fleet view ("which AI runs on **which** endpoints") needs tenant-wide data, which only the API can gather - so the deep detection is per-device and the aggregation is central. Both are Windows PowerShell 5.1, ASCII-only, read-only inventory (**never** `Win32_Product`), and change **no** device or policy - they only write the custom fields they are pointed at.
 
 ---
 
@@ -57,14 +64,15 @@ Cloud assistants such as **Anthropic Claude** and **OpenAI ChatGPT** run **no lo
 
 ---
 
-## Script variables
+## Script variables (agent script)
 
 | Variable | Type | Description |
 | --- | --- | --- |
 | `customFieldName` | Text | Name of the target custom field (e.g. `aiTag`). Required, must be writable by scripts. |
+| `dataFieldName` | Text | Optional. A second (multi-line text) device field for the compact JSON of the same findings, e.g. `aiData`. Set it wherever you want the fleet dashboard to be able to aggregate the device. Leave empty to write only the human-readable tag. |
 | `disabledVectors` | Text | Optional. Comma/space separated vectors to skip, e.g. `pkg, modelscan`. Unknown names are ignored with a warning. |
 
-`-DryRun` (Script parameters) only logs the value instead of writing it.
+`-DryRun` (Script parameters) only logs the value(s) instead of writing them.
 
 Turn off the more false-positive-prone heuristics if they are too noisy in your estate:
 
@@ -130,8 +138,10 @@ Example output in the activity log:
 1. **Administration -> Library -> Automation -> Add -> New Script**.
 2. Name: `AI Detection Tagging`, language: **PowerShell**, operating system: **Windows**, architecture: **All**.
 3. Paste the content of [`Set-AiDetectionTag.ps1`](Set-AiDetectionTag.ps1).
-4. Add the script variable `customFieldName` (and optionally `disabledVectors`).
+4. Add the script variable `customFieldName`, and `dataFieldName` (e.g. `aiData`) if you want the fleet dashboard; optionally `disabledVectors`.
 5. **Run as: System.** Important: per-user artifacts (model dirs, IDE extensions, config dirs, user API-key variables) are enumerated across every user profile and loaded `HKEY_USERS` hive, not just System's own.
+
+> For the fleet dashboard, create a second **Multi-line text** device field (e.g. `aiData`) with **Script Read/Write** and **API Read** permission, and set `dataFieldName` to it. This is the machine-readable JSON the dashboard aggregates; it is not meant to be read by humans.
 
 ### Step 3: Run it
 - **One-off / test:** run the script on a device with `-DryRun` in the script parameters and check the activity log.
@@ -145,6 +155,50 @@ Example output in the activity log:
 
 ---
 
+## Fleet dashboard (`Set-AiDashboard.ps1`)
+
+The central component. It runs on **one** device (or on a schedule), authenticates to the NinjaOne API, reads the `aiData` JSON from **every** device, aggregates it, and writes one **deep-analytical** dashboard into the global WYSIWYG field `aiDashboard`. Same WYSIWYG rules as the Policy Hierarchy Report: sanitized HTML with inline styles, background-bar charts and Font Awesome icons - no JavaScript, so it is a static view refreshed on each run.
+
+### What the dashboard shows
+- **KPI cards:** devices scanned, devices with AI, distinct AI tools, devices running AI *now*, devices with API keys, total local model storage across the fleet.
+- **AI tools across the fleet:** every tool with device count, a proportion bar, an *installed vs. running* status, and **on which devices** (linked device names).
+- **By category:** local runtime / desktop app / AI editor / coding assistant / CLI.
+- **Shadow-AI signals:** devices exposing a local LLM API and devices running an unidentified ML runtime.
+- **AI API keys by provider** and **AI SDKs (pip/npm) by package**, each with the device list.
+- **Local model storage by device.**
+
+### Data sources (public API, client credentials)
+```
+GET   /v2/devices                device id -> name
+GET   /v2/queries/custom-fields  the per-device aiData JSON (paged via cursor)
+PATCH /v2/system/custom-fields   write the dashboard HTML
+```
+
+### Requirements
+| Requirement | Details |
+| --- | --- |
+| API client app | Grant type **Client credentials**, scopes **Monitoring** and **Management** (Management is required to write custom field values). |
+| Data field | The device field from `dataFieldName` (e.g. `aiData`) with **API Read** permission, populated by the agent script. |
+| Dashboard field | A **global** custom field, type **WYSIWYG**, name `aiDashboard`, **API Write**. Enable **Expand large value on render** (the dashboard exceeds 10,000 characters). |
+
+### Setup
+1. Create the API client app (**Administration -> Apps -> API -> Client App IDs**, platform *API Services (machine-to-machine)*, scopes *Monitoring* + *Management*, grant *Client credentials*). Copy client ID and secret.
+2. Create the global WYSIWYG field `aiDashboard` (API **Write**).
+3. Add `Set-AiDashboard.ps1` as a **PowerShell / Windows** automation, run as **System**.
+4. Add script variables: `clientId`, `clientSecret`, `region` (default `eu`); optionally `dataFieldName` (default `aiData`) and `dashboardFieldName` (default `aiDashboard`).
+5. Run it on one device, then open the `aiDashboard` field. Schedule it (e.g. daily) after the agent script has populated `aiData` across the fleet.
+
+### Script variables (dashboard script)
+| Variable | Type | Description |
+| --- | --- | --- |
+| `clientId` | Text | API client ID (required). |
+| `clientSecret` | Text | API client secret (required). Consider entering it at runtime instead of a stored default. |
+| `region` | Text | NinjaOne region: `eu` (default), `app`, `ca`, `oc`, ... |
+| `dataFieldName` | Text | Device field to read the JSON from (default `aiData`). |
+| `dashboardFieldName` | Text | Global WYSIWYG field to write (default `aiDashboard`). |
+
+---
+
 ## Notes and limits
 
 - **Heuristics can produce false positives:** `mldll` and `modelscan` key on ML technology, so a game using DirectML or a photo app with ONNX can trigger them - therefore worded as *"Possible local AI ..."* and individually switchable via `disabledVectors`.
@@ -154,8 +208,11 @@ Example output in the activity log:
 - **API keys:** only the variable **name** is inspected and reported (e.g. `OPENAI_API_KEY`); the secret value is **never** read.
 - **No `Win32_Product`:** installed software is read from the uninstall registry keys. `Win32_Product` triggers a consistency check of every installed MSI package and can take minutes and change the device state.
 - **Cloud web usage is out of scope:** pure browser use of chatgpt.com / claude.ai leaves no local artefact and belongs on the network / DNS / proxy layer, not on the endpoint.
+- **Dashboard is a snapshot:** `Set-AiDashboard.ps1` renders static HTML on each run (WYSIWYG allows no JavaScript). Schedule it to keep it current; it only covers devices whose `aiData` field the agent script has populated.
+- **Dashboard device links** use `#/deviceDashboard/{id}/overview`; adjust the fragment in `New-DeviceLink` if your console uses a different device route.
+- **Not runtime-verified:** both scripts pass ASCII and brace-balance checks and manual review, but no live PowerShell/NinjaOne run was possible in the dev environment. Test the agent script with `-DryRun` and the dashboard script against a single client before scheduling. The `/v2/queries/custom-fields` response shape is parsed defensively but may vary by NinjaOne version.
 - **Local testing:**
 
 ```powershell
-.\Set-AiDetectionTag.ps1 -CustomFieldName aiTag -DisabledVectors 'modelscan' -DryRun
+.\Set-AiDetectionTag.ps1 -CustomFieldName aiTag -DataFieldName aiData -DisabledVectors 'modelscan' -DryRun
 ```
