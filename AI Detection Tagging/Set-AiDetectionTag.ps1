@@ -58,14 +58,24 @@
 
     NinjaOne script variables (injected as environment variables, use these calculated names):
         customFieldName    Name of the target custom field (required, must be writable by scripts)
+        dataFieldName      Optional: a second (multi-line text) device field the script writes a
+                           compact JSON of the same findings into. This is what the central dashboard
+                           script (Set-AiDashboard.ps1) reads to aggregate the whole fleet. Leave it
+                           empty on devices where you only want the human-readable tag.
         disabledVectors    Optional: comma/space separated list of vectors to skip
                            (software, process, service, port, artifact, ide, cli, env)
 
+    Two-component design:
+        1. This script runs per device (agent, as SYSTEM) and writes both the human-readable tag
+           and, when 'dataFieldName' is set, a machine-readable JSON of the findings.
+        2. Set-AiDashboard.ps1 runs centrally (API, on one device) and reads every device's JSON
+           field to build one fleet-wide WYSIWYG dashboard.
+
     Everything else is a constant in the "Defaults" block below - change it there if needed.
-    -DryRun only logs the value instead of writing it; it can be passed in the NinjaOne
+    -DryRun only logs the values instead of writing them; it can be passed in the NinjaOne
     "Script parameters" field of a run or schedule.
 
-    Exit codes: 0 = custom field written, 1 = error.
+    Exit codes: 0 = custom field(s) written, 1 = error.
 
     The source is kept ASCII-only on purpose: Windows PowerShell 5.1 reads BOM-less scripts as ANSI.
 
@@ -74,11 +84,16 @@
     Scans every vector and writes the findings into custom field 'aiTag'.
 
 .EXAMPLE
+    .\Set-AiDetectionTag.ps1 -CustomFieldName aiTag -DataFieldName aiData
+    Also writes a JSON of the findings into 'aiData' for the fleet dashboard to aggregate.
+
+.EXAMPLE
     .\Set-AiDetectionTag.ps1 -CustomFieldName aiTag -DisabledVectors 'env, cli' -DryRun
     Skips the API-key and CLI vectors and only logs what it would write.
 #>
 param(
     [string]$CustomFieldName = $env:customFieldName,
+    [string]$DataFieldName = $env:dataFieldName,
     [string]$DisabledVectors = $env:disabledVectors,
     [switch]$DryRun
 )
@@ -228,6 +243,15 @@ $script:EnvNameInventory  = $null
 # Populated by the named-catalog pass so the heuristic vectors do not re-report known tools
 $script:MatchedProcessNames = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
 $script:MatchedPorts        = New-Object System.Collections.Generic.HashSet[int]
+
+# Structured findings, filled alongside the human-readable strings, serialised to JSON for the dashboard
+$script:DataTools     = New-Object System.Collections.Generic.List[object]   # {n=name; e=evidence[]; a=active}
+$script:DataModels    = @{}                                                  # label -> bytes (known model dirs)
+$script:DataApiKeys   = New-Object System.Collections.Generic.List[string]
+$script:DataPackages  = New-Object System.Collections.Generic.List[string]
+$script:DataMlDll     = New-Object System.Collections.Generic.List[string]
+$script:DataApiServers = New-Object System.Collections.Generic.List[string]
+$script:DataModelScan = $null                                                # {count; bytes; exts[]}
 
 function Get-ProfileRoots {
     if ($null -ne $script:ProfileRoots) { return $script:ProfileRoots }
@@ -524,6 +548,9 @@ function Get-NamedDetections {
             $line = '{0} ({1})' -f $sig.Name, ($evidence -join ', ')
             Write-Log ('  Detected: {0}' -f $line)
             $results.Add($line)
+            # "active" = something is running now (a process or a listening port), not just installed
+            $active = [bool](@($evidence | Where-Object { $_ -eq 'running' -or $_ -like 'port *' }).Count)
+            $script:DataTools.Add([pscustomobject]@{ n = $sig.Name; e = @($evidence); a = $active })
         }
     }
     $results
@@ -550,6 +577,7 @@ function Get-ModelFileDetections {
     }
     if ($found.Count -eq 0) { return $null }
 
+    $script:DataModels = $found
     $parts = foreach ($label in ($found.Keys | Sort-Object)) { '{0} ({1})' -f $label, (Format-Size $found[$label]) }
     $line = 'Local AI models: ' + ($parts -join ', ')
     Write-Log ('  Detected: {0}' -f $line)
@@ -564,6 +592,7 @@ function Get-EnvKeyDetections {
     if ($names.Count -eq 0) { return $null }
 
     $unique = @($names | Sort-Object -Unique)
+    foreach ($n in $unique) { $script:DataApiKeys.Add($n) }
     $line = 'AI API keys in environment: ' + ($unique -join ', ')
     Write-Log ('  Detected: {0}' -f $line)
     $line
@@ -590,6 +619,7 @@ function Get-MlDllDetections {
     if ($hits.Count -eq 0) { return $null }
 
     $parts = foreach ($name in ($hits.Keys | Sort-Object)) { '{0} ({1})' -f $name, $hits[$name] }
+    foreach ($p in $parts) { $script:DataMlDll.Add($p) }
     $line = 'Possible local AI (ML runtime loaded): ' + ($parts -join ', ')
     Write-Log ('  Detected: {0}' -f $line)
     $line
@@ -623,6 +653,7 @@ function Get-ApiProbeDetections {
             $line = 'Local LLM server ({0}, port {1})' -f $kind, $port
             Write-Log ('  Detected: {0}' -f $line)
             $results.Add($line)
+            $script:DataApiServers.Add(('{0}, port {1}' -f $kind, $port))
         }
     }
     if ($results.Count -eq 0) { return $null }
@@ -649,7 +680,9 @@ function Get-ModelScanDetections {
     }
     if ($count -eq 0) { return $null }
 
-    $exts = ($seenExt | Sort-Object) -join ', '
+    $sortedExts = @($seenExt | Sort-Object)
+    $script:DataModelScan = [pscustomobject]@{ count = $count; bytes = $total; exts = $sortedExts }
+    $exts = $sortedExts -join ', '
     $line = 'Local model files: {0} file(s), {1} ({2})' -f $count, (Format-Size $total), $exts
     Write-Log ('  Detected: {0}' -f $line)
     $line
@@ -698,6 +731,7 @@ function Get-PkgDetections {
 
     if ($found.Count -eq 0) { return $null }
     $unique = @($found | Sort-Object -Unique)
+    foreach ($p in $unique) { $script:DataPackages.Add($p) }
     $line = 'AI SDKs installed: ' + ($unique -join ', ')
     Write-Log ('  Detected: {0}' -f $line)
     $line
@@ -808,8 +842,32 @@ try {
     # A multi-line value would break the log into several lines, so show it on one
     $logValue = $fieldValue -replace '\r?\n', ' | '
 
+    # Machine-readable JSON of the same findings, for the central dashboard to aggregate
+    $DataFieldName = "$DataFieldName".Trim()
+    $json = $null
+    if ($DataFieldName) {
+        $modelList = @()
+        foreach ($label in ($script:DataModels.Keys | Sort-Object)) {
+            $modelList += [pscustomobject]@{ label = $label; bytes = $script:DataModels[$label] }
+        }
+        $aiData = [ordered]@{
+            v          = 1
+            host       = $env:COMPUTERNAME
+            at         = (Get-Date).ToUniversalTime().ToString('o')
+            tools      = @($script:DataTools)
+            models     = @($modelList)
+            modelFiles = $script:DataModelScan
+            apiKeys    = @($script:DataApiKeys)
+            packages   = @($script:DataPackages)
+            mldll      = @($script:DataMlDll)
+            apiServers = @($script:DataApiServers)
+        }
+        $json = ConvertTo-Json -InputObject $aiData -Depth 6 -Compress
+    }
+
     if ($DryRun) {
         Write-Log ('Dry run: custom field "{0}" would be set to "{1}"' -f $CustomFieldName, $logValue)
+        if ($DataFieldName) { Write-Log ('Dry run: data field "{0}" would be set to {1} characters of JSON' -f $DataFieldName, $json.Length) }
         exit 0
     }
 
@@ -819,6 +877,11 @@ try {
     if (Get-Command -Name 'Ninja-Property-Get' -ErrorAction SilentlyContinue) {
         $readBack = "$(Ninja-Property-Get $CustomFieldName)" -replace '\r?\n', ' | '
         Write-Log ('  Read back: "{0}"' -f $readBack)
+    }
+
+    if ($DataFieldName) {
+        Set-NinjaCustomField -Name $DataFieldName -Value $json | Out-Null
+        Write-Log ('Data field "{0}" set ({1} characters of JSON)' -f $DataFieldName, $json.Length)
     }
 
     exit 0
