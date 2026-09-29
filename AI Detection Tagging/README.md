@@ -170,9 +170,18 @@ The central component. It runs on **one** device (or on a schedule), authenticat
 ### Data sources (public API, client credentials)
 ```
 GET   /v2/devices                device id -> name
-GET   /v2/queries/custom-fields  the per-device aiData JSON (paged via cursor)
+GET   /v2/queries/custom-fields  the per-device field (paged via cursor)
 PATCH /v2/system/custom-fields   write the dashboard HTML
 ```
+
+The dashboard reads whichever `dataFieldName` field it is pointed at and accepts **either** format: the machine-readable `aiData` JSON, **or** the human-readable tag field (e.g. `aiTag` / "AI Tag") as a fallback - so it works even with a single per-device field. JSON gives richer analytics (model sizes, evidence); the text fallback covers tools, API keys, SDKs, servers and ML-runtime lines.
+
+### Troubleshooting: dashboard shows "0 devices"
+The script writes the (empty) dashboard but the log says `0 rows returned`:
+- **API permission:** the source field must have **API: Read** (or Read/Write). Script Read/Write alone is not enough - `/v2/queries/custom-fields` only returns API-readable fields. This is the most common cause.
+- **Machine name:** `dataFieldName` must equal the field's **machine name** (not its label). "AI Tag" is a label; its machine name is what goes here.
+- **Scope:** it must be a **per-device (role) custom field**, not a global field. Global fields are written/read via `/v2/system/custom-fields`, not the query endpoint.
+- The run logs `query response fields: ...` and a `HINT:` line to point at the cause.
 
 ### Requirements
 | Requirement | Details |
