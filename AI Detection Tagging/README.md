@@ -71,6 +71,7 @@ Cloud assistants such as **Anthropic Claude** and **OpenAI ChatGPT** run **no lo
 | `customFieldName` | Text | Name of the target custom field (e.g. `aiTag`). Required, must be writable by scripts. |
 | `dataFieldName` | Text | Optional. A second (multi-line text) device field for the compact JSON of the same findings, e.g. `aiData`. Set it wherever you want the fleet dashboard to be able to aggregate the device. Leave empty to write only the human-readable tag. |
 | `disabledVectors` | Text | Optional. Comma/space separated vectors to skip, e.g. `pkg, modelscan`. Unknown names are ignored with a warning. |
+| `writeEventLog` | Text | Optional. `true` to also write Windows events (source `NinjaAIDetection`, Application log) for traceability and alerting. See [Windows Event Log](#windows-event-log-optional). Off unless set. |
 
 `-DryRun` (Script parameters) only logs the value(s) instead of writing them.
 
@@ -152,6 +153,30 @@ Example output in the activity log:
 - **Device search / filter:** filter on the custom field, e.g. `aiTag contains LLM server`.
 - **Condition:** custom field condition plus an alert when the value changes.
 - **Reports and dynamic groups:** the field is available as a column and as a group criterion.
+
+---
+
+## Windows Event Log (optional)
+
+Set the script variable `writeEventLog` to `true` and the agent also writes Windows events, so detections are **traceable over time** (the custom field is only a snapshot) and **NinjaOne / SIEM can alert** on them. Off unless enabled.
+
+- **Source** `NinjaAIDetection` in the **Application** log (created on first run; needs admin, which the agent has as SYSTEM).
+- **On change, not every run:** a local cache (`ai-detection-events-cache.json` in `NINJA_DATA_PATH`) means a scheduled run only logs *new* findings and *cleared* ones - plus one summary event each run so you can confirm it ran.
+
+| Event ID | Level | Meaning |
+| --- | --- | --- |
+| 5000 | Information | Scan summary (every run): counts of tools, servers, keys, ML runtimes, new/cleared |
+| 5001 | Warning | Local LLM server detected (new) - message includes the port |
+| 5002 | Warning | Unidentified ML runtime loaded (new) - process + runtime |
+| 5003 | Warning | AI API key present in environment (new) - the variable name |
+| 5004 | Information | Named AI tool detected (new) |
+| 5010 | Information | An AI signal from a previous run is no longer present (cleared) |
+
+Keep these IDs stable - conditions and SIEM rules build on them.
+
+**Alert in NinjaOne:** create a **Condition -> Windows Event Log**, source `NinjaAIDetection`, Event ID e.g. `5001` (or `5003`), and attach an alert / ticket / automation. That gives near-real-time shadow-AI alerting straight from the endpoint, independent of the dashboard.
+
+Enable it in the agent's script variables: add `writeEventLog` = `true`.
 
 ---
 
