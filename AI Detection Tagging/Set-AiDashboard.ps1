@@ -485,25 +485,44 @@ function New-DetailDeviceList($Devices) {
     ($parts -join '')
 }
 
-# Table of the AI-detection condition triggers pulled from the NinjaOne activity feed
+# Local time from an ISO event_time string (falls back to the raw string)
+function Format-ActivityTime([string]$Iso) {
+    try { return ([datetime]::Parse($Iso, $Invariant, [Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime().ToString('dd.MM.yyyy HH:mm:ss') }
+    catch { return [string]$Iso }
+}
+
+# Table of the AI-detection condition triggers pulled from the NinjaOne activity feed. The 5000
+# summary is a per-run heartbeat (it fires every scan, often all-zeros), so it is shown as a single
+# "last scan" line rather than as rows - otherwise a "0 servers" summary sits next to a real
+# "server detected" trigger and reads like a contradiction.
 function New-ActivityTable($Activities, [int]$Days) {
-    if (@($Activities).Count -eq 0) {
-        return (New-InfoCard 'success' 'fa-circle-check' 'No AI condition activity' ('No device triggered the AI detection condition in the last {0} day(s), or the Windows-Event condition is not set up yet.' -f $Days))
+    $all = @($Activities)
+    $triggers = @($all | Where-Object { $_.eventId -ne '5000' })
+    $summaries = @($all | Where-Object { $_.eventId -eq '5000' } | Sort-Object { $_.time } -Descending)
+
+    $lastScanHtml = ''
+    if ($summaries.Count -gt 0) {
+        $lastScanHtml = '<div style="font-size:12px;color:{0};margin-bottom:8px;">Last scan summary: {1} &middot; {2}</div>' -f `
+            $MutedColor, (ConvertTo-HtmlText (Format-ActivityTime $summaries[0].time)), (ConvertTo-HtmlText $summaries[0].message)
     }
+
+    if ($triggers.Count -eq 0) {
+        return $lastScanHtml + (New-InfoCard 'success' 'fa-circle-check' 'No AI detection triggers' ('No device triggered a detection (event 5001-5004) in the last {0} day(s). Per-run scan summaries are not listed here.' -f $Days))
+    }
+
     $rows = ''
-    foreach ($activity in (@($Activities) | Sort-Object { $_.time } -Descending | Select-Object -First 60)) {
+    foreach ($activity in ($triggers | Sort-Object { $_.time } -Descending | Select-Object -First 60)) {
         $variant = if (@('5001', '5002', '5003') -contains $activity.eventId) { 'danger' } elseif ($activity.eventId -eq '5010') { 'warning' } else { 'info' }
-        $when = [string]$activity.time
-        try { $when = ([datetime]::Parse($activity.time, $Invariant, [Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime().ToString('dd.MM.yyyy HH:mm:ss') } catch { }
         $statusChip = if ($activity.status -and $activity.status -ne 'TRIGGERED') { New-Chip $activity.status 'neutral' '0 0 0 6px' } else { '' }
         $rows += '<tr>' +
         ('<td style="padding:5px 8px;font-size:13px;vertical-align:top;">{0}</td>' -f (New-DeviceLink $activity.deviceId $activity.name)) +
         ('<td style="padding:5px 8px;vertical-align:top;">{0}{1}</td>' -f (New-Chip $activity.eventId $variant '0'), $statusChip) +
-        ('<td style="padding:5px 8px;font-size:12px;vertical-align:top;white-space:nowrap;">{0}</td>' -f (ConvertTo-HtmlText $when)) +
+        ('<td style="padding:5px 8px;font-size:12px;vertical-align:top;white-space:nowrap;">{0}</td>' -f (ConvertTo-HtmlText (Format-ActivityTime $activity.time))) +
         ('<td style="padding:5px 8px;font-size:12px;vertical-align:top;">{0}</td>' -f (ConvertTo-HtmlText $activity.message)) +
         '</tr>'
     }
-    ('<div style="font-size:12px;color:{0};margin-bottom:8px;">Condition triggers from the NinjaOne activity feed (last {1} days, newest first).</div>' -f $MutedColor, $Days) +
+    $lastScanHtml +
+    ('<div style="font-size:12px;color:{0};margin-bottom:8px;">Detection triggers from the NinjaOne activity feed (last {1} days, newest first; per-run summaries excluded).</div>' -f $MutedColor, $Days) +
     '<table style="width:100%;border-collapse:collapse;"><thead><tr>' +
     '<th style="text-align:left;padding:6px 8px;width:22%;">Device</th>' +
     '<th style="text-align:left;padding:6px 8px;width:10%;">Event ID</th>' +
