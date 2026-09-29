@@ -407,7 +407,7 @@ function Get-ToolBrand([string]$Name) {
 function New-ToolCard($Tool) {
     $brand = Get-ToolBrand $Tool.Name
     $category = Get-ToolCategory $Tool.Name
-    $badge = '<div style="width:36px;height:36px;border-radius:9px;background-color:{0};color:#ffffff;font-size:13px;font-weight:bold;text-align:center;line-height:36px;">{1}</div>' -f $brand[0], (ConvertTo-HtmlText $brand[1])
+    $badge = '<div style="width:36px;height:36px;min-width:36px;border-radius:9px;background-color:{0};color:#ffffff;font-size:13px;font-weight:bold;display:flex;align-items:center;justify-content:center;flex-shrink:0;text-align:center;">{1}</div>' -f $brand[0], (ConvertTo-HtmlText $brand[1])
     $deviceChip = New-Chip ("$($Tool.Hits) device" + $(if ($Tool.Hits -eq 1) { '' } else { 's' })) 'info' '0'
     $runningChip = if ($Tool.Active -gt 0) { New-Chip ("$($Tool.Active) running") 'danger' '0 0 0 6px' } else { New-Chip 'installed only' 'neutral' '0 0 0 6px' }
     '<div style="border:1px solid #e2e8f0;border-radius:10px;padding:12px;height:100%;box-sizing:border-box;">' +
