@@ -344,12 +344,14 @@ function New-DashboardHtml {
 
     # --- Shadow-AI signals: local LLM servers and ML runtimes loaded ---
     $shadow = ''
-    if (@($Data.serverDevices).Count -gt 0) {
-        $shadow += (New-InfoCard 'warning' 'fa-server' 'Local LLM servers responding' ('{0} device(s) expose an LLM API on localhost.' -f @($Data.serverDevices).Count))
+    # Note: do NOT wrap these List[object] in @(); @() on a List[object] throws "Argument types do
+    # not match" in PowerShell. List objects have their own .Count and enumerate fine in pipelines.
+    if ($Data.serverDevices.Count -gt 0) {
+        $shadow += (New-InfoCard 'warning' 'fa-server' 'Local LLM servers responding' ('{0} device(s) expose an LLM API on localhost.' -f $Data.serverDevices.Count))
         $shadow += '<div style="font-size:12px;margin:0 0 12px;">{0}</div>' -f (New-DeviceList $Data.serverDevices 30)
     }
-    if (@($Data.mldllDevices).Count -gt 0) {
-        $shadow += (New-InfoCard 'warning' 'fa-microchip' 'ML runtime loaded (unidentified)' ('{0} device(s) run a process with an ML runtime that is not a named tool.' -f @($Data.mldllDevices).Count))
+    if ($Data.mldllDevices.Count -gt 0) {
+        $shadow += (New-InfoCard 'warning' 'fa-microchip' 'ML runtime loaded (unidentified)' ('{0} device(s) run a process with an ML runtime that is not a named tool.' -f $Data.mldllDevices.Count))
         $shadow += '<div style="font-size:12px;margin:0 0 4px;">{0}</div>' -f (New-DeviceList $Data.mldllDevices 30)
     }
     if (-not $shadow) { $shadow = New-InfoCard 'success' 'fa-circle-check' 'No unidentified local AI' 'No local LLM servers or unnamed ML runtimes were found.' }

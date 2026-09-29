@@ -850,17 +850,19 @@ try {
         foreach ($label in ($script:DataModels.Keys | Sort-Object)) {
             $modelList += [pscustomobject]@{ label = $label; bytes = $script:DataModels[$label] }
         }
+        # Do NOT wrap the List[object]/List[string] accumulators in @(): @() on a List[object] throws
+        # "Argument types do not match" in PowerShell. ConvertTo-Json serialises the lists as arrays.
         $aiData = [ordered]@{
             v          = 1
             host       = $env:COMPUTERNAME
             at         = (Get-Date).ToUniversalTime().ToString('o')
-            tools      = @($script:DataTools)
+            tools      = $script:DataTools
             models     = @($modelList)
             modelFiles = $script:DataModelScan
-            apiKeys    = @($script:DataApiKeys)
-            packages   = @($script:DataPackages)
-            mldll      = @($script:DataMlDll)
-            apiServers = @($script:DataApiServers)
+            apiKeys    = $script:DataApiKeys
+            packages   = $script:DataPackages
+            mldll      = $script:DataMlDll
+            apiServers = $script:DataApiServers
         }
         $json = ConvertTo-Json -InputObject $aiData -Depth 6 -Compress
     }

@@ -210,7 +210,7 @@ PATCH /v2/system/custom-fields   write the dashboard HTML
 - **Cloud web usage is out of scope:** pure browser use of chatgpt.com / claude.ai leaves no local artefact and belongs on the network / DNS / proxy layer, not on the endpoint.
 - **Dashboard is a snapshot:** `Set-AiDashboard.ps1` renders static HTML on each run (WYSIWYG allows no JavaScript). Schedule it to keep it current; it only covers devices whose `aiData` field the agent script has populated.
 - **Dashboard device links** use `#/deviceDashboard/{id}/overview`; adjust the fragment in `New-DeviceLink` if your console uses a different device route.
-- **Not runtime-verified:** both scripts pass ASCII and brace-balance checks and manual review, but no live PowerShell/NinjaOne run was possible in the dev environment. Test the agent script with `-DryRun` and the dashboard script against a single client before scheduling. The `/v2/queries/custom-fields` response shape is parsed defensively but may vary by NinjaOne version.
+- **Verification:** both scripts parse under PowerShell 7 and the dashboard render + aggregation are tested end-to-end against mocked API data (empty and populated). The live NinjaOne API was not reachable from the dev environment, so the `/v2/queries/custom-fields` and `/v2/devices` response shapes are parsed defensively but may still vary by NinjaOne version - test the agent script with `-DryRun` and the dashboard against a single client before scheduling.
 - **Local testing:**
 
 ```powershell
