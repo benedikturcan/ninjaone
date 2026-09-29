@@ -201,6 +201,8 @@ PATCH /v2/system/custom-fields   write the dashboard HTML
 
 The dashboard reads whichever `dataFieldName` field it is pointed at and accepts **either** format: the machine-readable `aiData` JSON, **or** the human-readable tag field (e.g. `aiTag` / "AI Tag") as a fallback - so it works even with a single per-device field. JSON gives richer analytics (model sizes, evidence); the text fallback covers tools, API keys, SDKs, servers and ML-runtime lines.
 
+It also pulls the **AI condition activity** from `/v2/activities`: when the Windows-Event condition (source `NinjaAIDetection`) fires, NinjaOne records it as a device activity, and the dashboard shows a **Device / Event ID / Time / Message** table of those triggers. Filtered by `data.message.params.event_source == activitySourceName` (default `NinjaAIDetection`) over the last `activityDays` days (default 30). Set `activityConditionUid` to the condition's `sourceConfigUid` to query only that condition (faster on busy tenants). Requires the [Windows Event Log](#windows-event-log-optional) feature to be enabled on the agent and the condition to be set up.
+
 ### Troubleshooting: dashboard shows "0 devices"
 The script writes the (empty) dashboard but the log says `0 rows returned`:
 - **API permission:** the source field must have **API: Read** (or Read/Write). Script Read/Write alone is not enough - `/v2/queries/custom-fields` only returns API-readable fields. This is the most common cause.
@@ -230,6 +232,9 @@ The script writes the (empty) dashboard but the log says `0 rows returned`:
 | `region` | Text | NinjaOne region: `eu` (default), `app`, `ca`, `oc`, ... |
 | `dataFieldName` | Text | Device field to read the JSON from (default `aiData`). |
 | `dashboardFieldName` | Text | Global WYSIWYG field to write (default `aiDashboard`). |
+| `activitySourceName` | Text | Event source to match in the activity feed (default `NinjaAIDetection`). |
+| `activityConditionUid` | Text | Optional. The condition's `sourceConfigUid` to query only that condition's activities. |
+| `activityDays` | Text | Optional. Activity lookback window in days (default `30`). |
 
 ---
 

@@ -47,7 +47,10 @@ param(
     [string]$ClientSecret = $env:clientSecret,
     [string]$Region = $env:region,
     [string]$DataFieldName = $env:dataFieldName,
-    [string]$DashboardFieldName = $env:dashboardFieldName
+    [string]$DashboardFieldName = $env:dashboardFieldName,
+    [string]$ActivitySourceName = $env:activitySourceName,
+    [string]$ActivityConditionUid = $env:activityConditionUid,
+    [string]$ActivityDays = $env:activityDays
 )
 
 $ErrorActionPreference = 'Stop'
@@ -58,6 +61,9 @@ if (-not $ClientSecret) { $ClientSecret = $env:NINJA_CLIENT_SECRET }
 if (-not $Region) { $Region = if ($env:NINJA_REGION) { $env:NINJA_REGION } else { 'eu' } }
 if (-not $DataFieldName) { $DataFieldName = 'aiData' }
 if (-not $DashboardFieldName) { $DashboardFieldName = 'aiDashboard' }
+if (-not $ActivitySourceName) { $ActivitySourceName = 'NinjaAIDetection' }   # event source to match in activities
+$ActivityLookbackDays = 30
+if ($ActivityDays) { [void][int]::TryParse($ActivityDays, [ref]$ActivityLookbackDays) }
 
 $ApiUrl = "https://$Region.ninjarmm.com"
 $Invariant = [Globalization.CultureInfo]::InvariantCulture
@@ -162,6 +168,65 @@ function Resolve-DeviceName([string]$Id) {
     if (-not $name) { $name = "Device $Id" }
     $script:DeviceNames[$Id] = $name
     $name
+}
+
+# Reads the AI-detection condition triggers from the NinjaOne activity feed (/v2/activities).
+# Our events are CONDITION activities whose data.message.params.event_source is the agent's source
+# ('NinjaAIDetection'). Each carries event_id, event_time and the message - exactly what we show.
+function Get-AiActivities {
+    param([string]$SourceName, [int]$Days, [string]$ConditionUid)
+    $results = New-Object System.Collections.Generic.List[object]
+    $cutoff = (Get-Date).ToUniversalTime().AddDays(-[math]::Abs($Days))
+    $olderThan = $null
+    $page = 0
+    do {
+        $endpoint = '/v2/activities?pageSize=200'
+        if ($ConditionUid) { $endpoint += "&sourceConfigUid=$ConditionUid" }
+        if ($olderThan) { $endpoint += "&olderThan=$olderThan" }
+
+        $response = $null
+        try { $response = Invoke-NinjaApi $endpoint }
+        catch { Write-Host "  Warning: activities query failed ($($_.Exception.Message))"; break }
+
+        $activities = @($response.activities)
+        if ($page -eq 0) { Write-Host ("  activities response fields: " + (($response.PSObject.Properties.Name) -join ', ')) }
+        if ($activities.Count -eq 0) { break }
+
+        $minId = $null; $reachedCutoff = $false
+        foreach ($activity in $activities) {
+            if ($null -eq $minId -or [long]$activity.id -lt $minId) { $minId = [long]$activity.id }
+            $when = $null
+            try { $when = [DateTimeOffset]::FromUnixTimeSeconds([long]$activity.activityTime).UtcDateTime } catch { }
+            if ($when -and $when -lt $cutoff) { $reachedCutoff = $true; continue }
+            if ([string]$activity.activityType -ne 'CONDITION') { continue }
+
+            $params = $activity.data.message.params
+            $source = if ($params) { [string]$params.event_source } else { '' }
+            if ($SourceName) {
+                if ($source) { if ($source -ne $SourceName) { continue } }
+                elseif (([string]$activity.message) -notmatch [regex]::Escape($SourceName)) { continue }
+            }
+
+            $eventId = if ($params -and $params.event_id) { [string]$params.event_id } else { [string]$activity.subject }
+            $eventTime = if ($params -and $params.event_time) { [string]$params.event_time } elseif ($when) { $when.ToString('o') } else { '' }
+            $eventMsg = if ($params -and $params.msg) { [string]$params.msg } else { [string]$activity.message }
+
+            $results.Add([pscustomobject]@{
+                deviceId = [string]$activity.deviceId
+                name     = Resolve-DeviceName ([string]$activity.deviceId)
+                eventId  = $eventId
+                status   = [string]$activity.statusCode
+                time     = $eventTime
+                message  = $eventMsg
+            })
+        }
+
+        $olderThan = $minId
+        $page++
+        if ($reachedCutoff) { break }
+    } while ($activities.Count -eq 200 -and $page -lt 25)
+
+    $results
 }
 
 # Reads one custom field across all devices, following the query cursor to the end.
@@ -420,6 +485,33 @@ function New-DetailDeviceList($Devices) {
     ($parts -join '')
 }
 
+# Table of the AI-detection condition triggers pulled from the NinjaOne activity feed
+function New-ActivityTable($Activities, [int]$Days) {
+    if (@($Activities).Count -eq 0) {
+        return (New-InfoCard 'success' 'fa-circle-check' 'No AI condition activity' ('No device triggered the AI detection condition in the last {0} day(s), or the Windows-Event condition is not set up yet.' -f $Days))
+    }
+    $rows = ''
+    foreach ($activity in (@($Activities) | Sort-Object { $_.time } -Descending | Select-Object -First 60)) {
+        $variant = if (@('5001', '5002', '5003') -contains $activity.eventId) { 'danger' } elseif ($activity.eventId -eq '5010') { 'warning' } else { 'info' }
+        $when = [string]$activity.time
+        try { $when = ([datetime]::Parse($activity.time, $Invariant, [Globalization.DateTimeStyles]::RoundtripKind)).ToLocalTime().ToString('dd.MM.yyyy HH:mm:ss') } catch { }
+        $statusChip = if ($activity.status -and $activity.status -ne 'TRIGGERED') { New-Chip $activity.status 'neutral' '0 0 0 6px' } else { '' }
+        $rows += '<tr>' +
+        ('<td style="padding:5px 8px;font-size:13px;vertical-align:top;">{0}</td>' -f (New-DeviceLink $activity.deviceId $activity.name)) +
+        ('<td style="padding:5px 8px;vertical-align:top;">{0}{1}</td>' -f (New-Chip $activity.eventId $variant '0'), $statusChip) +
+        ('<td style="padding:5px 8px;font-size:12px;vertical-align:top;white-space:nowrap;">{0}</td>' -f (ConvertTo-HtmlText $when)) +
+        ('<td style="padding:5px 8px;font-size:12px;vertical-align:top;">{0}</td>' -f (ConvertTo-HtmlText $activity.message)) +
+        '</tr>'
+    }
+    ('<div style="font-size:12px;color:{0};margin-bottom:8px;">Condition triggers from the NinjaOne activity feed (last {1} days, newest first).</div>' -f $MutedColor, $Days) +
+    '<table style="width:100%;border-collapse:collapse;"><thead><tr>' +
+    '<th style="text-align:left;padding:6px 8px;width:22%;">Device</th>' +
+    '<th style="text-align:left;padding:6px 8px;width:10%;">Event ID</th>' +
+    '<th style="text-align:left;padding:6px 8px;width:16%;">Time</th>' +
+    '<th style="text-align:left;padding:6px 8px;">Message</th>' +
+    '</tr></thead><tbody>' + $rows + '</tbody></table>'
+}
+
 # NinjaOne WYSIWYG blocks <img> and <svg>, so real product logos are impossible. Instead each tool
 # gets a brand-coloured monogram badge (colour + 1-2 letters) - the closest the sanitizer allows.
 $ToolBrand = @{
@@ -554,6 +646,9 @@ function New-DashboardHtml {
     }
     else { New-InfoCard 'success' 'fa-circle-check' 'No local model files' 'No device stores local model weight files.' }
 
+    # --- Condition activity from the NinjaOne activity feed ---
+    $activityTable = New-ActivityTable $Data.activities $Data.activityDays
+
     # --- Assemble ---
     '<div>' +
     (New-InfoCard '' 'fa-robot' 'AI Detection Dashboard' ("Generated $((Get-Date).ToString('dd.MM.yyyy HH:mm:ss')) from {0} device(s) reporting via '{1}'." -f $Data.devicesScanned, (ConvertTo-HtmlText $DataFieldName))) +
@@ -563,6 +658,7 @@ function New-DashboardHtml {
     ('<div class="col-12 col-xl-6">{0}</div>' -f (New-FullWidthCard '<i class="fa-solid fa-layer-group"></i>&nbsp;By category' $categoryCard)) +
     ('<div class="col-12 col-xl-6">{0}</div>' -f (New-FullWidthCard '<i class="fa-solid fa-triangle-exclamation"></i>&nbsp;Shadow-AI signals' $shadow)) +
     '</div>' +
+    (New-FullWidthCard '<i class="fa-solid fa-bell"></i>&nbsp;AI condition activity (NinjaOne)' $activityTable) +
     (New-FullWidthCard '<i class="fa-solid fa-key"></i>&nbsp;AI API keys by provider' $keyCard) +
     (New-FullWidthCard '<i class="fa-solid fa-cube"></i>&nbsp;AI SDKs (pip / npm)' $pkgCard) +
     (New-FullWidthCard '<i class="fa-solid fa-hard-drive"></i>&nbsp;Local model storage by device' $modelCard) +
@@ -588,6 +684,10 @@ try {
     Write-Host "Loading custom field '$DataFieldName' across all devices..."
     $rows = Get-CustomFieldValues -FieldName $DataFieldName
     Write-Host "  $(@($rows).Count) rows returned"
+
+    Write-Host "Loading AI condition activity (source '$ActivitySourceName', last $ActivityLookbackDays days)..."
+    $activities = @(Get-AiActivities -SourceName $ActivitySourceName -Days $ActivityLookbackDays -ConditionUid $ActivityConditionUid)
+    Write-Host "  $($activities.Count) matching activit(ies)"
 
     # Aggregate
     $tools = @{}          # name -> @{ Name; Count; Active; Devices=@() }
@@ -707,6 +807,8 @@ try {
         serverDevices   = $serverDevices
         mldllDevices    = $mldllDevices
         modelDevices    = $modelDevices
+        activities      = $activities
+        activityDays    = $ActivityLookbackDays
     }
 
     Write-Host "Aggregated: $devicesWithAi of $devicesScanned devices with AI, $($toolList.Count) distinct tools ($parseErrors unparseable value(s))"
