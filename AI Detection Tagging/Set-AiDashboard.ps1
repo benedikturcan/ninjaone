@@ -430,6 +430,11 @@ function ConvertTo-HtmlText($Value) {
     ([string]$Value).Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;')
 }
 
+# A small info icon with a native (title-attribute) tooltip - the WYSIWYG allows the title attribute
+function New-InfoTip([string]$Text) {
+    ' <i class="fa-solid fa-circle-info" style="font-size:12px;color:{0};cursor:help;" title="{1}"></i>' -f $MutedColor, (ConvertTo-HtmlText $Text)
+}
+
 function Format-Size([double]$Bytes) {
     if ($Bytes -ge 1099511627776) { return ('{0:N1} TB' -f ($Bytes / 1099511627776)) }
     if ($Bytes -ge 1073741824) { return ('{0:N1} GB' -f ($Bytes / 1073741824)) }
@@ -452,8 +457,9 @@ function New-FullWidthCard([string]$Title, [string]$Body) {
     '<div style="display:block;width:100%;margin-bottom:16px;"><div class="card flex-grow-1" style="width:100%;"><div class="card-title-box"><div class="card-title">{0}</div></div><div class="card-body">{1}</div></div></div>' -f $Title, $Body
 }
 
-function New-StatCard([string]$Value, [string]$Label) {
-    '<div class="col"><div class="stat-card"><div class="stat-value">{0}</div><div class="stat-desc">{1}</div></div></div>' -f (ConvertTo-HtmlText $Value), (ConvertTo-HtmlText $Label)
+function New-StatCard([string]$Value, [string]$Label, [string]$Tip = '') {
+    $tipHtml = if ($Tip) { New-InfoTip $Tip } else { '' }
+    '<div class="col"><div class="stat-card"><div class="stat-value">{0}</div><div class="stat-desc">{1}{2}</div></div></div>' -f (ConvertTo-HtmlText $Value), (ConvertTo-HtmlText $Label), $tipHtml
 }
 
 # A horizontal proportion bar (WYSIWYG renders background colours, not border-top/bottom lines)
@@ -578,12 +584,12 @@ function New-DashboardHtml {
     # --- KPI cards ---
     $modelSize = Format-Size $Data.totalModelBytes
     $stats = '<div class="row g-3" style="margin-bottom:16px;">' +
-    (New-StatCard $Data.devicesScanned 'Devices scanned') +
-    (New-StatCard $Data.devicesWithAi 'Devices with AI') +
-    (New-StatCard $Data.distinctTools 'Distinct AI tools') +
-    (New-StatCard $Data.devicesActive 'Running AI now') +
-    (New-StatCard $Data.devicesWithKeys 'Devices with API keys') +
-    (New-StatCard $modelSize 'Local model storage') +
+    (New-StatCard $Data.devicesScanned 'Devices scanned' 'Devices whose AI field the dashboard could read this run.') +
+    (New-StatCard $Data.devicesWithAi 'Devices with AI' 'Devices where at least one AI signal was found (tool, API key, SDK, local server, model file or ML runtime).') +
+    (New-StatCard $Data.distinctTools 'Distinct AI tools' 'Number of different named AI tools seen across the fleet.') +
+    (New-StatCard $Data.devicesActive 'Running AI now' 'Devices with an AI process running or a local LLM server responding at scan time.') +
+    (New-StatCard $Data.devicesWithKeys 'Devices with API keys' 'Devices with an AI provider API key in their environment. Only the variable name is read, never the value.') +
+    (New-StatCard $modelSize 'Local model storage' 'Total size of local model files and known model directories across the fleet.') +
     '</div>'
 
     # --- Tool cards: one card per tool, brand badge + the devices that use it below ---
@@ -673,15 +679,15 @@ function New-DashboardHtml {
     '<div>' +
     (New-InfoCard '' 'fa-robot' 'AI Detection Dashboard' ("Generated $((Get-Date).ToString('dd.MM.yyyy HH:mm:ss')) from {0} device(s) reporting via '{1}'." -f $Data.devicesScanned, (ConvertTo-HtmlText $DataFieldName))) +
     $stats +
-    (New-FullWidthCard '<i class="fa-solid fa-robot"></i>&nbsp;AI tools by device' $toolCards) +
+    (New-FullWidthCard ('<i class="fa-solid fa-robot"></i>&nbsp;AI tools by device' + (New-InfoTip 'Named catalog AI tools found on the fleet, one card per tool. "running" = a process or local server is active now; "installed only" = present but not running.')) $toolCards) +
     '<div class="row g-3">' +
-    ('<div class="col-12 col-xl-6">{0}</div>' -f (New-FullWidthCard '<i class="fa-solid fa-layer-group"></i>&nbsp;By category' $categoryCard)) +
-    ('<div class="col-12 col-xl-6">{0}</div>' -f (New-FullWidthCard '<i class="fa-solid fa-triangle-exclamation"></i>&nbsp;Shadow-AI signals' $shadow)) +
+    ('<div class="col-12 col-xl-6">{0}</div>' -f (New-FullWidthCard ('<i class="fa-solid fa-layer-group"></i>&nbsp;By category' + (New-InfoTip 'Named catalog tools grouped by category (Local runtime, Desktop app, AI editor, Coding assistant, CLI), counting devices per category. Generic signals - unidentified servers, API keys, SDKs, model files - are not counted here; they have their own cards below.')) $categoryCard)) +
+    ('<div class="col-12 col-xl-6">{0}</div>' -f (New-FullWidthCard ('<i class="fa-solid fa-triangle-exclamation"></i>&nbsp;Shadow-AI signals' + (New-InfoTip 'Unidentified local AI: a local LLM server responding on a port, or a process with an ML runtime (onnxruntime, torch, ...) loaded that is not a named catalog tool.')) $shadow)) +
     '</div>' +
-    (New-FullWidthCard '<i class="fa-solid fa-bell"></i>&nbsp;AI condition activity (NinjaOne)' $activityTable) +
-    (New-FullWidthCard '<i class="fa-solid fa-key"></i>&nbsp;AI API keys by provider' $keyCard) +
-    (New-FullWidthCard '<i class="fa-solid fa-cube"></i>&nbsp;AI SDKs (pip / npm)' $pkgCard) +
-    (New-FullWidthCard '<i class="fa-solid fa-hard-drive"></i>&nbsp;Local model storage by device' $modelCard) +
+    (New-FullWidthCard ('<i class="fa-solid fa-bell"></i>&nbsp;AI condition activity (NinjaOne)' + (New-InfoTip 'Condition triggers from the NinjaOne activity feed for event source NinjaAIDetection. The per-run scan summary (event 5000) is shown as a single "last scan" line, not as rows.')) $activityTable) +
+    (New-FullWidthCard ('<i class="fa-solid fa-key"></i>&nbsp;AI API keys by provider' + (New-InfoTip 'Environment variables that look like an AI provider key, grouped by provider. Only the variable name is inspected - the secret value is never read.')) $keyCard) +
+    (New-FullWidthCard ('<i class="fa-solid fa-cube"></i>&nbsp;AI SDKs (pip / npm)' + (New-InfoTip 'AI SDKs installed via pip (site-packages) or the global npm store, e.g. anthropic, openai, @anthropic-ai/sdk.')) $pkgCard) +
+    (New-FullWidthCard ('<i class="fa-solid fa-hard-drive"></i>&nbsp;Local model storage by device' + (New-InfoTip 'Local model weight files (.gguf, .safetensors, .onnx, ...) and known model directories (Ollama, LM Studio, HF cache, ...), summed per device.')) $modelCard) +
     '</div>'
 }
 
