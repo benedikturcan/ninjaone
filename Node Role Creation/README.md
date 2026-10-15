@@ -1,92 +1,92 @@
 # NinjaOne Node Role Creation
 
-Legt benutzerdefinierte **Node-Rollen** (node roles) in NinjaOne per Skript an - gesteuert ueber
-Parameter, welche Rollen erstellt werden. Praktisch, wenn du immer wieder denselben Satz von
-Server-Rollen in einem Tenant brauchst und das nicht per Hand im UI klicken willst.
+Creates custom **node roles** in NinjaOne via script - parameter-driven selection of which roles
+to create. Handy when you repeatedly need the same set of server roles in a tenant and don't want
+to click them together by hand in the UI.
 
-Ein Skript: [`New-NinjaNodeRole.ps1`](New-NinjaNodeRole.ps1).
+One script: [`New-NinjaNodeRole.ps1`](New-NinjaNodeRole.ps1).
 
 ---
 
 ## TL;DR
 
-- Authentifiziert sich mit einem **Session-Cookie** (`sessionKey`) aus einer angemeldeten
-  Browser-Sitzung und sendet pro Rolle einen `POST /swb/s6/noderole`.
-- **Der Session-Key steht NICHT im Skript.** Er kommt per Umgebungsvariable
-  `NINJA_SESSION_KEY` oder per `-SessionKey` Parameter rein.
-- `-Roles` bestimmt, was angelegt wird: `server-all` fuer alle oder einzelne Kurzschluessel
+- Authenticates with a **session cookie** (`sessionKey`) from a logged-in browser session and
+  sends one `POST /swb/s6/noderole` per role.
+- **The session key is NOT stored in the script.** It comes from the `NINJA_SESSION_KEY`
+  environment variable or the `-SessionKey` parameter.
+- `-Roles` controls what gets created: `server-all` for all, or individual short keys
   (`sql,terminal`).
-- `-WhatIf` fuer einen gefahrlosen Trockenlauf.
+- `-WhatIf` for a safe dry run.
 
 ```powershell
-$env:NINJA_SESSION_KEY = "<sessionKey-aus-dem-browser>"
+$env:NINJA_SESSION_KEY = "<sessionKey-from-browser>"
 .\New-NinjaNodeRole.ps1 -Roles server-all
 ```
 
 ---
 
-## Verfuegbare Rollen
+## Available roles
 
-Alle unter der Parent-Rolle `WINDOWS_SERVER` (`nodeRoleParentId = 1`):
+All under the parent role `WINDOWS_SERVER` (`nodeRoleParentId = 1`):
 
-| Kurzschluessel | Angelegte Rolle |
+| Short key | Role created |
 | --- | --- |
 | `datev` | Windows Server - DATEV |
 | `sql` | Windows Server - SQL Server |
 | `terminal` | Windows Server - Terminal Server |
 | `application` | Windows Server - Application Server |
 | `file` | Windows Server - File Server |
-| `server-all` | alle fuenf oben |
+| `server-all` | all five above |
 
 ---
 
-## Session-Key besorgen
+## Getting the session key
 
-Der `sessionKey` ist ein **kurzlebiges Session-Cookie** aus einer angemeldeten NinjaOne-Sitzung,
-kein API-Token. So kommst du dran:
+The `sessionKey` is a **short-lived session cookie** from a logged-in NinjaOne session, not an
+API token. How to get it:
 
-1. In NinjaOne im Browser anmelden (z.B. `https://eu.ninjarmm.com`).
-2. DevTools oeffnen -> **Application/Storage -> Cookies** -> den Wert von `sessionKey` kopieren
-   (alternativ im **Network**-Tab bei einem beliebigen Request unter den Request-Headers).
-3. Als Umgebungsvariable setzen (bleibt so aus der Befehlshistorie und aus dem Code raus):
+1. Sign in to NinjaOne in the browser (e.g. `https://eu.ninjarmm.com`).
+2. Open DevTools -> **Application/Storage -> Cookies** -> copy the value of `sessionKey`
+   (alternatively from the **Network** tab on any request under the request headers).
+3. Set it as an environment variable (keeps it out of shell history and out of the code):
 
    ```powershell
-   $env:NINJA_SESSION_KEY = "<dein-sessionKey>"
+   $env:NINJA_SESSION_KEY = "<your-sessionKey>"
    ```
 
-Laeuft die Sitzung ab, kommt `401`/`403` zurueck - dann neu anmelden und den aktuellen Wert holen.
+When the session expires you get `401`/`403` back - sign in again and grab the current value.
 
-> Der Key gilt wie ein Passwort: nicht committen, nicht in Tickets/Chats posten.
+> The key is like a password: don't commit it, don't post it in tickets/chats.
 
 ---
 
-## Verwendung
+## Usage
 
-Alle Server-Rollen anlegen:
+Create all server roles:
 
 ```powershell
 .\New-NinjaNodeRole.ps1 -Roles server-all
 ```
 
-Nur einzelne Rollen (kommagetrennt, Reihenfolge und Gross-/Kleinschreibung egal):
+Only individual roles (comma-separated, order and case don't matter):
 
 ```powershell
 .\New-NinjaNodeRole.ps1 -Roles sql,terminal
 ```
 
-Trockenlauf - zeigt die geplanten Requests, sendet aber nichts:
+Dry run - shows the planned requests but sends nothing:
 
 ```powershell
 .\New-NinjaNodeRole.ps1 -Roles server-all -WhatIf
 ```
 
-Session-Key einmalig fuer einen Lauf statt per Umgebungsvariable:
+Session key for a single run instead of via the environment variable:
 
 ```powershell
-.\New-NinjaNodeRole.ps1 -Roles sql -SessionKey "<dein-sessionKey>"
+.\New-NinjaNodeRole.ps1 -Roles sql -SessionKey "<your-sessionKey>"
 ```
 
-Andere Instanz als `eu` (z.B. `app`, `us2`):
+A different instance than `eu` (e.g. `app`, `us2`):
 
 ```powershell
 .\New-NinjaNodeRole.ps1 -Roles server-all -Region app
@@ -94,45 +94,46 @@ Andere Instanz als `eu` (z.B. `app`, `us2`):
 
 ---
 
-## Parameter
+## Parameters
 
-| Parameter | Pflicht | Default | Beschreibung |
+| Parameter | Required | Default | Description |
 | --- | --- | --- | --- |
-| `-Roles` | ja | - | Eine/mehrere Rollen: `server-all` oder Kurzschluessel (`datev,sql,terminal,application,file`) |
-| `-SessionKey` | nein | `$env:NINJA_SESSION_KEY` | Session-Cookie-Wert. Fehlt beides, bricht das Skript mit klarer Meldung ab |
-| `-Region` | nein | `eu` | Instanz-Subdomain (`eu` -> `eu.ninjarmm.com`) |
-| `-WhatIf` | nein | - | Trockenlauf, sendet keinen Request |
+| `-Roles` | yes | - | One/more roles: `server-all` or short keys (`datev,sql,terminal,application,file`) |
+| `-SessionKey` | no | `$env:NINJA_SESSION_KEY` | Session cookie value. If both are missing, the script aborts with a clear message |
+| `-Region` | no | `eu` | Instance subdomain (`eu` -> `eu.ninjarmm.com`) |
+| `-WhatIf` | no | - | Dry run, sends no request |
 
 ---
 
-## Weitere Rollen hinzufuegen
+## Adding more roles
 
-Kein Code noetig - nur Daten ergaenzen. Oben im Skript gibt es zwei Strukturen:
+No code needed - just add data. There are two structures at the top of the script:
 
-- **`$RoleCatalog`** - eine Zeile pro Rolle (Key = Kurzschluessel):
+- **`$RoleCatalog`** - one line per role (key = short key):
 
   ```powershell
   rdp = @{ name = "Workstation - RDP Client"; nodeClass = "WINDOWS_WORKSTATION"; nodeRoleParentId = <ID> }
   ```
 
-- **`$RoleGroups`** - Sammel-Keywords, die auf mehrere Rollen expandieren:
+- **`$RoleGroups`** - group keywords that expand to multiple roles:
 
   ```powershell
   "workstation-all" = @("rdp","kiosk")
   ```
 
-**Achtung:** jede Parent-Kategorie hat eine **eigene `nodeRoleParentId`**. `WINDOWS_SERVER` ist `1`.
-Die ID fuer andere Klassen (`WINDOWS_WORKSTATION`, `MAC`, `LINUX_SERVER` ...) liest du im
-**Network**-Tab ab, wenn du eine Rolle in der jeweiligen Kategorie ueber das UI anlegst (Wert
-`nodeRoleParentId` im POST-Body).
+**Note:** each parent category has its **own `nodeRoleParentId`**. `WINDOWS_SERVER` is `1`.
+The ID for other classes (`WINDOWS_WORKSTATION`, `MAC`, `LINUX_SERVER` ...) can be read from the
+**Network** tab when you create a role in that category via the UI (the `nodeRoleParentId` value
+in the POST body).
 
 ---
 
-## Hinweise
+## Notes
 
-- Doppelte Angaben (z.B. `server-all,datev`) werden dedupliziert.
-- Unbekannte Kurzschluessel brechen mit einer Liste der gueltigen Werte ab.
-- Jede Rolle meldet Status (`[OK 201]` / `[FEHLER <code>]`), am Ende eine Zusammenfassung.
-  Exit-Code `1`, falls mindestens eine Rolle fehlschlug.
-- Das Skript nutzt den internen `/swb/s6/noderole`-Endpunkt (dieselbe Route, die das Web-UI
-  verwendet), kein offizielles API - bei UI-Aenderungen kann sich das Verhalten aendern.
+- Duplicate entries (e.g. `server-all,datev`) are deduplicated.
+- Unknown short keys abort with a list of valid values.
+- Each role reports its status (`[OK 201]` / `[ERROR <code>]`), with a summary at the end.
+  Exit code `1` if at least one role failed.
+- The script talks directly to the internal `/swb/s6/noderole` endpoint via .NET `HttpClient`
+  (the same route the web UI uses, with `AllowAutoRedirect` disabled so the session cookie is
+  never sent over http). It is not an official API - behavior may change when the UI changes.

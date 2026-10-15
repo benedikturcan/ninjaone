@@ -1,59 +1,57 @@
 <#
 .SYNOPSIS
-    Erstellt benutzerdefinierte NinjaOne Node-Rollen (node roles) ueber den internen
-    /swb/s6/noderole Endpunkt - gesteuert ueber Parameter, welche Rollen angelegt werden.
+    Creates custom NinjaOne node roles via the internal /swb/s6/noderole endpoint -
+    parameter-driven selection of which roles to create.
 
 .DESCRIPTION
-    Das Skript authentifiziert sich mit einem bestehenden Browser-Session-Cookie (sessionKey)
-    und sendet fuer jede ausgewaehlte Rolle einen POST an https://<region>.ninjarmm.com/swb/s6/noderole.
+    Authenticates with an existing browser session cookie (sessionKey) and sends a POST to
+    https://<region>.ninjarmm.com/swb/s6/noderole for each selected role.
 
-    Welche Rollen angelegt werden, bestimmt der Parameter -Roles. Du kannst entweder das
-    Sammel-Keyword 'server-all' angeben (legt alle Windows-Server-Rollen an) oder einzelne
-    Rollen selektiv per Kurzschluessel waehlen (z.B. datev,sql).
+    The -Roles parameter controls what gets created. Pass the group keyword 'server-all'
+    (creates all Windows Server roles) or select individual roles by short key (e.g. datev,sql).
 
-    Verfuegbare Windows-Server-Rollen (alle unter Parent WINDOWS_SERVER, nodeRoleParentId = 1):
+    Available Windows Server roles (all under parent WINDOWS_SERVER, nodeRoleParentId = 1):
         datev         Windows Server - DATEV
         sql           Windows Server - SQL Server
         terminal      Windows Server - Terminal Server
         application   Windows Server - Application Server
         file          Windows Server - File Server
 
-    Der sessionKey ist ein kurzlebiges Session-Cookie aus einer angemeldeten Browser-Sitzung.
-    Laeuft er ab, bekommst du 401/403 zurueck - dann im Browser neu anmelden und den aktuellen
-    Cookie-Wert uebergeben.
+    The sessionKey is a short-lived session cookie from a logged-in browser session. Once it
+    expires you get 401/403 back - sign in again in the browser and pass the current cookie value.
 
 .PARAMETER Roles
-    Eine oder mehrere Rollen, die angelegt werden sollen. Akzeptiert:
-        server-all                          -> alle Windows-Server-Rollen
-        datev, sql, terminal, application, file  -> einzelne Rollen (kommagetrennt)
+    One or more roles to create. Accepts:
+        server-all                               -> all Windows Server roles
+        datev, sql, terminal, application, file  -> individual roles (comma-separated)
 
 .PARAMETER SessionKey
-    Der sessionKey Cookie-Wert aus der angemeldeten NinjaOne Browser-Sitzung.
-    Wird kein Wert uebergeben, liest das Skript die Umgebungsvariable NINJA_SESSION_KEY.
-    Der Schluessel wird bewusst NICHT im Skript hinterlegt (Secret).
+    The sessionKey cookie value from the logged-in NinjaOne browser session.
+    If omitted, the script reads the NINJA_SESSION_KEY environment variable.
+    The key is intentionally NOT stored in the script (secret).
 
 .PARAMETER Region
-    Die NinjaOne Instanz-Subdomain (z.B. 'eu', 'app', 'us2'). Default: eu.
+    The NinjaOne instance subdomain (e.g. 'eu', 'app', 'us2'). Default: eu.
 
 .PARAMETER WhatIf
-    Zeigt nur an, was gesendet wuerde, ohne den POST tatsaechlich auszufuehren.
+    Shows what would be sent without actually performing the POST.
 
 .EXAMPLE
     .\New-NinjaNodeRole.ps1 -Roles server-all
-    Legt alle fuenf Windows-Server-Rollen an.
+    Creates all five Windows Server roles.
 
 .EXAMPLE
     .\New-NinjaNodeRole.ps1 -Roles datev,sql
-    Legt nur "Windows Server - DATEV" und "Windows Server - SQL Server" an.
+    Creates only "Windows Server - DATEV" and "Windows Server - SQL Server".
 
 .EXAMPLE
     .\New-NinjaNodeRole.ps1 -Roles server-all -WhatIf
-    Trockenlauf: zeigt die geplanten Requests, sendet aber nichts.
+    Dry run: shows the planned requests but sends nothing.
 
 .EXAMPLE
-    $env:NINJA_SESSION_KEY = "<sessionKey-aus-dem-browser>"
+    $env:NINJA_SESSION_KEY = "<sessionKey-from-browser>"
     .\New-NinjaNodeRole.ps1 -Roles sql,terminal
-    Session-Key ueber die Umgebungsvariable setzen, dann selektiv Rollen anlegen.
+    Set the session key via the environment variable, then create selected roles.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -74,10 +72,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($SessionKey)) {
-    throw "Kein Session-Key. Setze `$env:NINJA_SESSION_KEY oder uebergib -SessionKey '<wert>'."
+    throw "No session key. Set `$env:NINJA_SESSION_KEY or pass -SessionKey '<value>'."
 }
 
-# Katalog aller bekannten Rollen. Key = Kurzschluessel fuer -Roles.
+# Catalog of all known roles. Key = short key for -Roles.
 $RoleCatalog = [ordered]@{
     datev       = @{ name = "Windows Server - DATEV";              nodeClass = "WINDOWS_SERVER"; nodeRoleParentId = 1 }
     sql         = @{ name = "Windows Server - SQL Server";         nodeClass = "WINDOWS_SERVER"; nodeRoleParentId = 1 }
@@ -86,12 +84,12 @@ $RoleCatalog = [ordered]@{
     file        = @{ name = "Windows Server - File Server";        nodeClass = "WINDOWS_SERVER"; nodeRoleParentId = 1 }
 }
 
-# Sammel-Keywords, die auf mehrere Rollen expandieren.
+# Group keywords that expand to multiple roles.
 $RoleGroups = @{
     "server-all" = @("datev", "sql", "terminal", "application", "file")
 }
 
-# --- Rollen-Auswahl aufloesen -------------------------------------------------
+# --- Resolve role selection ---------------------------------------------------
 $selected = [System.Collections.Specialized.OrderedDictionary]::new()
 foreach ($token in $Roles) {
     $key = $token.Trim().ToLowerInvariant()
@@ -107,23 +105,29 @@ foreach ($token in $Roles) {
     }
     else {
         $valid = (@($RoleGroups.Keys) + @($RoleCatalog.Keys)) -join ", "
-        throw "Unbekannte Rolle '$token'. Gueltige Werte: $valid"
+        throw "Unknown role '$token'. Valid values: $valid"
     }
 }
 
 if ($selected.Count -eq 0) {
-    throw "Keine Rollen ausgewaehlt."
+    throw "No roles selected."
 }
 
-# --- HTTP-Session vorbereiten -------------------------------------------------
-$baseUrl = "https://$Region.ninjarmm.com"
-$uri     = "$baseUrl/swb/s6/noderole"
+# --- Prepare HTTP client ------------------------------------------------------
+$baseUrl   = "https://$Region.ninjarmm.com"
+$uri       = "$baseUrl/swb/s6/noderole"
+$userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
 
-$session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
-$session.UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
-$session.Cookies.Add((New-Object System.Net.Cookie("sessionKey", $SessionKey, "/", "$Region.ninjarmm.com")))
+# Use .NET HttpClient directly instead of Invoke-WebRequest: the create POST responds with a
+# redirect to an http:// URL. AllowAutoRedirect=$false returns the 3xx status cleanly (no
+# exception like Invoke-WebRequest in PS 7.4+), and the session cookie is never sent over
+# unencrypted http.
+try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop } catch { }
+$handler = [System.Net.Http.HttpClientHandler]::new()
+$handler.AllowAutoRedirect = $false
+$client = [System.Net.Http.HttpClient]::new($handler)
 
-$headers = @{
+$headers = [ordered]@{
     "accept"           = "*/*"
     "accept-language"  = "en-US,en;q=0.9,de-DE;q=0.8,de;q=0.7,fr;q=0.6"
     "origin"           = $baseUrl
@@ -133,13 +137,15 @@ $headers = @{
     "sec-fetch-dest"   = "empty"
     "sec-fetch-mode"   = "cors"
     "sec-fetch-site"   = "same-origin"
+    "user-agent"       = $userAgent
+    "cookie"           = "sessionKey=$SessionKey"
 }
 
-Write-Host "Ziel: $uri"
-Write-Host ("Ausgewaehlte Rollen ({0}): {1}" -f $selected.Count, (($selected.Values | ForEach-Object { $_.name }) -join ", "))
+Write-Host "Target: $uri"
+Write-Host ("Selected roles ({0}): {1}" -f $selected.Count, (($selected.Values | ForEach-Object { $_.name }) -join ", "))
 Write-Host ""
 
-# --- Rollen anlegen -----------------------------------------------------------
+# --- Create roles -------------------------------------------------------------
 $created = 0
 $failed  = 0
 
@@ -159,21 +165,39 @@ foreach ($role in $selected.Values) {
         continue
     }
 
+    $req  = $null
+    $resp = $null
     try {
-        $response = Invoke-WebRequest -UseBasicParsing -Uri $uri -Method POST `
-            -WebSession $session -Headers $headers -ContentType "application/json" -Body $body
+        $req = [System.Net.Http.HttpRequestMessage]::new([System.Net.Http.HttpMethod]::Post, $uri)
+        $req.Content = [System.Net.Http.StringContent]::new($body, [System.Text.Encoding]::UTF8, "application/json")
+        foreach ($h in $headers.GetEnumerator()) {
+            [void]$req.Headers.TryAddWithoutValidation($h.Key, [string]$h.Value)
+        }
 
-        Write-Host ("[OK {0}] {1}" -f $response.StatusCode, $role.name) -ForegroundColor Green
-        $created++
+        $resp = $client.SendAsync($req).GetAwaiter().GetResult()
+        $code = [int]$resp.StatusCode
+
+        if ($code -lt 400) {
+            # 2xx = created directly, 3xx = created + Location redirect (which we do not follow)
+            Write-Host ("[OK {0}] {1}" -f $code, $role.name) -ForegroundColor Green
+            $created++
+        }
+        else {
+            $respBody = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            Write-Host ("[ERROR {0}] {1} - {2}" -f $code, $role.name, $respBody) -ForegroundColor Red
+            $failed++
+        }
     }
     catch {
-        $status = $null
-        if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
-        Write-Host ("[FEHLER {0}] {1} - {2}" -f $status, $role.name, $_.Exception.Message) -ForegroundColor Red
+        Write-Host ("[ERROR] {0} - {1}" -f $role.name, $_.Exception.Message) -ForegroundColor Red
         $failed++
+    }
+    finally {
+        if ($resp) { $resp.Dispose() }
+        if ($req)  { $req.Dispose() }
     }
 }
 
 Write-Host ""
-Write-Host ("Fertig. Erstellt: {0}, Fehlgeschlagen: {1}" -f $created, $failed)
+Write-Host ("Done. Created: {0}, Failed: {1}" -f $created, $failed)
 if ($failed -gt 0) { exit 1 }
