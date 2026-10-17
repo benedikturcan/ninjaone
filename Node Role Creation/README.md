@@ -129,7 +129,10 @@ A different instance than `eu` (e.g. `app`, `us2`):
 
 ## Adding more roles
 
-No code needed - just add data. There are two structures at the top of the script:
+No code needed - just add data. Roles and groups live in the shared file
+[`../Shared/NinjaRoleCatalog.ps1`](../Shared/NinjaRoleCatalog.ps1), which this script and the
+[Child Policy Creation](../Policy%20Creation/) script both dot-source (so role and policy
+naming never drift apart). There are two structures:
 
 - **`$RoleCatalog`** - one line per role (key = short key):
 

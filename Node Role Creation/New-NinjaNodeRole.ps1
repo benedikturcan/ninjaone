@@ -10,23 +10,9 @@
     The -Roles parameter controls what gets created. Pass a group keyword (e.g. 'server-all')
     or select individual roles by short key (e.g. datev,sql).
 
-    Windows Server roles (under parent WINDOWS_SERVER, nodeRoleParentId = 1):
-        datev            Windows Server - DATEV
-        sql              Windows Server - SQL Server
-        terminal         Windows Server - Terminal Server
-        application      Windows Server - Application Server
-        file             Windows Server - File Server
-        testserver       Windows Server - Test Server
-
-    Windows Workstation roles (under parent WINDOWS_WORKSTATION, nodeRoleParentId = 2):
-        homeoffice       Workstation - Home Office
-        vip              Workstation - VIP
-        testworkstation  Workstation - Test Workstation
-
-    Group keywords:
-        server-all       -> datev, sql, terminal, application, file
-        workstation-all  -> homeoffice, vip
-        testlab          -> testserver, testworkstation
+    The role catalog and group keywords live in ..\Shared\NinjaRoleCatalog.ps1 (shared with
+    New-NinjaChildPolicy.ps1 so role and policy naming never drift). Run with -Roles ? or an
+    unknown key to see the list of valid values.
 
     The sessionKey is a short-lived session cookie from a logged-in browser session. Once it
     expires you get 401/403 back - sign in again in the browser and pass the current cookie value.
@@ -85,66 +71,17 @@ if ([string]::IsNullOrWhiteSpace($SessionKey)) {
     throw "No session key. Set `$env:NINJA_SESSION_KEY or pass -SessionKey '<value>'."
 }
 
-# Catalog of all known roles. Key = short key for -Roles.
-# nodeRoleParentId is the id of the built-in parent role this custom role hangs under:
-#   1 = WINDOWS_SERVER, 2 = WINDOWS_WORKSTATION (confirmed via GET /swb/s6/noderole/list).
-$RoleCatalog = [ordered]@{
-    # Windows Server roles (under built-in WINDOWS_SERVER, id 1)
-    datev           = @{ name = "Windows Server - DATEV";             nodeClass = "WINDOWS_SERVER";      nodeRoleParentId = 1 }
-    sql             = @{ name = "Windows Server - SQL Server";        nodeClass = "WINDOWS_SERVER";      nodeRoleParentId = 1 }
-    terminal        = @{ name = "Windows Server - Terminal Server";   nodeClass = "WINDOWS_SERVER";      nodeRoleParentId = 1 }
-    application     = @{ name = "Windows Server - Application Server"; nodeClass = "WINDOWS_SERVER";      nodeRoleParentId = 1 }
-    file            = @{ name = "Windows Server - File Server";        nodeClass = "WINDOWS_SERVER";      nodeRoleParentId = 1 }
-    testserver      = @{ name = "Windows Server - Test Server";        nodeClass = "WINDOWS_SERVER";      nodeRoleParentId = 1 }
-
-    # Windows Workstation roles (under built-in WINDOWS_WORKSTATION, id 2)
-    homeoffice      = @{ name = "Workstation - Home Office";           nodeClass = "WINDOWS_WORKSTATION"; nodeRoleParentId = 2 }
-    vip             = @{ name = "Workstation - VIP";                   nodeClass = "WINDOWS_WORKSTATION"; nodeRoleParentId = 2 }
-    testworkstation = @{ name = "Workstation - Test Workstation";      nodeClass = "WINDOWS_WORKSTATION"; nodeRoleParentId = 2 }
-
-    # --- Coming later: macOS and Linux roles ----------------------------------
-    # No role names decided yet. The parent ids are already known from
-    # GET /swb/s6/noderole/list, so adding a role later is a one-liner - uncomment
-    # and rename. Pattern: a custom role's nodeRoleParentId = id of its built-in parent.
-    #   <key> = @{ name = "Linux Server - NGINX"; nodeClass = "LINUX_SERVER";      nodeRoleParentId = 21 }
-    #   <key> = @{ name = "Linux - Kiosk";        nodeClass = "LINUX_WORKSTATION"; nodeRoleParentId = 3  }
-    #   <key> = @{ name = "Mac - Design";         nodeClass = "MAC";               nodeRoleParentId = 4  }
-    #   <key> = @{ name = "Mac Server - CI";      nodeClass = "MAC_SERVER";        nodeRoleParentId = 22 }
+# --- Shared role catalog ------------------------------------------------------
+# Defines $RoleCatalog, $RoleGroups, $CategoryMeta and Resolve-NinjaRoleSelection.
+# Path built without literal separators so it works on Windows and macOS/Linux alike.
+$catalogPath = Join-Path (Join-Path (Split-Path -Parent $PSScriptRoot) "Shared") "NinjaRoleCatalog.ps1"
+if (-not (Test-Path $catalogPath)) {
+    throw "Shared catalog not found at '$catalogPath'. Expected a 'Shared/NinjaRoleCatalog.ps1' next to this script's folder."
 }
-
-# Group keywords that expand to multiple roles.
-$RoleGroups = @{
-    "server-all"      = @("datev", "sql", "terminal", "application", "file")
-    "workstation-all" = @("homeoffice", "vip")
-    "testlab"         = @("testserver", "testworkstation")
-    # Coming later, once macOS / Linux roles exist:
-    # "mac-all"       = @(...)
-    # "linux-all"     = @(...)
-}
+. $catalogPath
 
 # --- Resolve role selection ---------------------------------------------------
-$selected = [System.Collections.Specialized.OrderedDictionary]::new()
-foreach ($token in $Roles) {
-    $key = $token.Trim().ToLowerInvariant()
-    if ([string]::IsNullOrWhiteSpace($key)) { continue }
-
-    if ($RoleGroups.ContainsKey($key)) {
-        foreach ($member in $RoleGroups[$key]) {
-            if (-not $selected.Contains($member)) { $selected.Add($member, $RoleCatalog[$member]) }
-        }
-    }
-    elseif ($RoleCatalog.Contains($key)) {
-        if (-not $selected.Contains($key)) { $selected.Add($key, $RoleCatalog[$key]) }
-    }
-    else {
-        $valid = (@($RoleGroups.Keys) + @($RoleCatalog.Keys)) -join ", "
-        throw "Unknown role '$token'. Valid values: $valid"
-    }
-}
-
-if ($selected.Count -eq 0) {
-    throw "No roles selected."
-}
+$selected = Resolve-NinjaRoleSelection -Roles $Roles
 
 # --- Prepare HTTP client ------------------------------------------------------
 $baseUrl   = "https://$Region.ninjarmm.com"
