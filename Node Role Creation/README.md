@@ -27,7 +27,7 @@ $env:NINJA_SESSION_KEY = "<sessionKey-from-browser>"
 
 ## Available roles
 
-All under the parent role `WINDOWS_SERVER` (`nodeRoleParentId = 1`):
+**Windows Server** roles (under parent `WINDOWS_SERVER`, `nodeRoleParentId = 1`):
 
 | Short key | Role created |
 | --- | --- |
@@ -36,7 +36,23 @@ All under the parent role `WINDOWS_SERVER` (`nodeRoleParentId = 1`):
 | `terminal` | Windows Server - Terminal Server |
 | `application` | Windows Server - Application Server |
 | `file` | Windows Server - File Server |
-| `server-all` | all five above |
+| `testserver` | Windows Server - Test Server |
+
+**Windows Workstation** roles (under parent `WINDOWS_WORKSTATION`, `nodeRoleParentId = 2`):
+
+| Short key | Role created |
+| --- | --- |
+| `homeoffice` | Workstation - Home Office |
+| `vip` | Workstation - VIP |
+| `testworkstation` | Workstation - Test Workstation |
+
+**Group keywords:**
+
+| Keyword | Expands to |
+| --- | --- |
+| `server-all` | `datev, sql, terminal, application, file` |
+| `workstation-all` | `homeoffice, vip` |
+| `testlab` | `testserver, testworkstation` |
 
 ---
 
@@ -74,6 +90,12 @@ Only individual roles (comma-separated, order and case don't matter):
 .\New-NinjaNodeRole.ps1 -Roles sql,terminal
 ```
 
+Mix groups and individual roles (e.g. all servers plus the test lab roles):
+
+```powershell
+.\New-NinjaNodeRole.ps1 -Roles server-all,testworkstation,testserver
+```
+
 Dry run - shows the planned requests but sends nothing:
 
 ```powershell
@@ -98,7 +120,7 @@ A different instance than `eu` (e.g. `app`, `us2`):
 
 | Parameter | Required | Default | Description |
 | --- | --- | --- | --- |
-| `-Roles` | yes | - | One/more roles: `server-all` or short keys (`datev,sql,terminal,application,file`) |
+| `-Roles` | yes | - | One/more roles: group keywords (`server-all`, `workstation-all`, `testlab`) and/or short keys (`datev,sql,terminal,application,file,testserver,homeoffice,vip,testworkstation`) |
 | `-SessionKey` | no | `$env:NINJA_SESSION_KEY` | Session cookie value. If both are missing, the script aborts with a clear message |
 | `-Region` | no | `eu` | Instance subdomain (`eu` -> `eu.ninjarmm.com`) |
 | `-WhatIf` | no | - | Dry run, sends no request |
@@ -121,10 +143,22 @@ No code needed - just add data. There are two structures at the top of the scrip
   "workstation-all" = @("rdp","kiosk")
   ```
 
-**Note:** each parent category has its **own `nodeRoleParentId`**. `WINDOWS_SERVER` is `1`.
-The ID for other classes (`WINDOWS_WORKSTATION`, `MAC`, `LINUX_SERVER` ...) can be read from the
-**Network** tab when you create a role in that category via the UI (the `nodeRoleParentId` value
-in the POST body).
+**Note:** each parent category has its **own `nodeRoleParentId`** - the id of the built-in parent
+role the custom role hangs under. These are already known (read from
+`GET /swb/s6/noderole/list?allRoles=true` while signed in):
+
+| `nodeClass` | `nodeRoleParentId` | For custom roles like |
+| --- | --- | --- |
+| `WINDOWS_SERVER` | `1` | Windows Server - … |
+| `WINDOWS_WORKSTATION` | `2` | Workstation - … |
+| `LINUX_WORKSTATION` | `3` | Linux - … |
+| `LINUX_SERVER` | `21` | Linux Server - … |
+| `MAC` | `4` | Mac - … |
+| `MAC_SERVER` | `22` | Mac Server - … |
+
+macOS and Linux roles are **not defined yet** (no role names decided) - the script has commented
+placeholders for them. Adding one later is a single catalog line with the matching `nodeClass`
+and `nodeRoleParentId` from the table above.
 
 ---
 
