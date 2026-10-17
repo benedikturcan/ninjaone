@@ -7,23 +7,33 @@
     Authenticates with an existing browser session cookie (sessionKey) and sends a POST to
     https://<region>.ninjarmm.com/swb/s6/noderole for each selected role.
 
-    The -Roles parameter controls what gets created. Pass the group keyword 'server-all'
-    (creates all Windows Server roles) or select individual roles by short key (e.g. datev,sql).
+    The -Roles parameter controls what gets created. Pass a group keyword (e.g. 'server-all')
+    or select individual roles by short key (e.g. datev,sql).
 
-    Available Windows Server roles (all under parent WINDOWS_SERVER, nodeRoleParentId = 1):
-        datev         Windows Server - DATEV
-        sql           Windows Server - SQL Server
-        terminal      Windows Server - Terminal Server
-        application   Windows Server - Application Server
-        file          Windows Server - File Server
+    Windows Server roles (under parent WINDOWS_SERVER, nodeRoleParentId = 1):
+        datev            Windows Server - DATEV
+        sql              Windows Server - SQL Server
+        terminal         Windows Server - Terminal Server
+        application      Windows Server - Application Server
+        file             Windows Server - File Server
+        testserver       Windows Server - Test Server
+
+    Windows Workstation roles (under parent WINDOWS_WORKSTATION, nodeRoleParentId = 2):
+        homeoffice       Workstation - Home Office
+        vip              Workstation - VIP
+        testworkstation  Workstation - Test Workstation
+
+    Group keywords:
+        server-all       -> datev, sql, terminal, application, file
+        workstation-all  -> homeoffice, vip
+        testlab          -> testserver, testworkstation
 
     The sessionKey is a short-lived session cookie from a logged-in browser session. Once it
     expires you get 401/403 back - sign in again in the browser and pass the current cookie value.
 
 .PARAMETER Roles
-    One or more roles to create. Accepts:
-        server-all                               -> all Windows Server roles
-        datev, sql, terminal, application, file  -> individual roles (comma-separated)
+    One or more roles to create. Accepts group keywords (server-all, workstation-all, testlab)
+    and/or individual short keys (comma-separated), e.g. -Roles server-all,testworkstation,testserver
 
 .PARAMETER SessionKey
     The sessionKey cookie value from the logged-in NinjaOne browser session.
@@ -76,17 +86,40 @@ if ([string]::IsNullOrWhiteSpace($SessionKey)) {
 }
 
 # Catalog of all known roles. Key = short key for -Roles.
+# nodeRoleParentId is the id of the built-in parent role this custom role hangs under:
+#   1 = WINDOWS_SERVER, 2 = WINDOWS_WORKSTATION (confirmed via GET /swb/s6/noderole/list).
 $RoleCatalog = [ordered]@{
-    datev       = @{ name = "Windows Server - DATEV";              nodeClass = "WINDOWS_SERVER"; nodeRoleParentId = 1 }
-    sql         = @{ name = "Windows Server - SQL Server";         nodeClass = "WINDOWS_SERVER"; nodeRoleParentId = 1 }
-    terminal    = @{ name = "Windows Server - Terminal Server";    nodeClass = "WINDOWS_SERVER"; nodeRoleParentId = 1 }
-    application = @{ name = "Windows Server - Application Server";  nodeClass = "WINDOWS_SERVER"; nodeRoleParentId = 1 }
-    file        = @{ name = "Windows Server - File Server";        nodeClass = "WINDOWS_SERVER"; nodeRoleParentId = 1 }
+    # Windows Server roles (under built-in WINDOWS_SERVER, id 1)
+    datev           = @{ name = "Windows Server - DATEV";             nodeClass = "WINDOWS_SERVER";      nodeRoleParentId = 1 }
+    sql             = @{ name = "Windows Server - SQL Server";        nodeClass = "WINDOWS_SERVER";      nodeRoleParentId = 1 }
+    terminal        = @{ name = "Windows Server - Terminal Server";   nodeClass = "WINDOWS_SERVER";      nodeRoleParentId = 1 }
+    application     = @{ name = "Windows Server - Application Server"; nodeClass = "WINDOWS_SERVER";      nodeRoleParentId = 1 }
+    file            = @{ name = "Windows Server - File Server";        nodeClass = "WINDOWS_SERVER";      nodeRoleParentId = 1 }
+    testserver      = @{ name = "Windows Server - Test Server";        nodeClass = "WINDOWS_SERVER";      nodeRoleParentId = 1 }
+
+    # Windows Workstation roles (under built-in WINDOWS_WORKSTATION, id 2)
+    homeoffice      = @{ name = "Workstation - Home Office";           nodeClass = "WINDOWS_WORKSTATION"; nodeRoleParentId = 2 }
+    vip             = @{ name = "Workstation - VIP";                   nodeClass = "WINDOWS_WORKSTATION"; nodeRoleParentId = 2 }
+    testworkstation = @{ name = "Workstation - Test Workstation";      nodeClass = "WINDOWS_WORKSTATION"; nodeRoleParentId = 2 }
+
+    # --- Coming later: macOS and Linux roles ----------------------------------
+    # No role names decided yet. The parent ids are already known from
+    # GET /swb/s6/noderole/list, so adding a role later is a one-liner - uncomment
+    # and rename. Pattern: a custom role's nodeRoleParentId = id of its built-in parent.
+    #   <key> = @{ name = "Linux Server - NGINX"; nodeClass = "LINUX_SERVER";      nodeRoleParentId = 21 }
+    #   <key> = @{ name = "Linux - Kiosk";        nodeClass = "LINUX_WORKSTATION"; nodeRoleParentId = 3  }
+    #   <key> = @{ name = "Mac - Design";         nodeClass = "MAC";               nodeRoleParentId = 4  }
+    #   <key> = @{ name = "Mac Server - CI";      nodeClass = "MAC_SERVER";        nodeRoleParentId = 22 }
 }
 
 # Group keywords that expand to multiple roles.
 $RoleGroups = @{
-    "server-all" = @("datev", "sql", "terminal", "application", "file")
+    "server-all"      = @("datev", "sql", "terminal", "application", "file")
+    "workstation-all" = @("homeoffice", "vip")
+    "testlab"         = @("testserver", "testworkstation")
+    # Coming later, once macOS / Linux roles exist:
+    # "mac-all"       = @(...)
+    # "linux-all"     = @(...)
 }
 
 # --- Resolve role selection ---------------------------------------------------
