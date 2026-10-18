@@ -28,8 +28,18 @@
     expires you get 401/403 back - sign in again in the browser and pass the current value.
 
 .PARAMETER RoleId
-    The numeric id of the technician role to configure. Default: 8 (the "1st Level Support" role).
-    Find it in the role editor URL: #/editor/role/<id>/permissions/...
+    The numeric id of an EXISTING technician role to configure. Default: 8 (the "1st Level
+    Support" role). Find it in the role editor URL: #/editor/role/<id>/permissions/...
+    Use this to update a role you already know by id.
+
+.PARAMETER RoleName
+    Target a technician role BY NAME. The script lists the technician roles and, if a role with
+    this exact name exists, updates it; if none exists, it CREATES a new technician role with
+    this name (POST) and then applies the profile. Use this to create-or-update in one run.
+
+.PARAMETER Description
+    Description for a role created via -RoleName (ignored when updating an existing role).
+    Default: empty.
 
 .PARAMETER ProfileName
     Which permission profile from the built-in catalog to apply. Default: "1st-level-support".
@@ -57,12 +67,24 @@
 .EXAMPLE
     .\Set-NinjaTechnicianRole.ps1 -RoleId 12 -SessionKey "<value>" -Region app
     Applies the profile to role id 12 on a different instance with a one-off session key.
+
+.EXAMPLE
+    .\Set-NinjaTechnicianRole.ps1 -RoleName "1st Level Support" -Description "L1 helpdesk"
+    Creates a technician role named "1st Level Support" (if it does not exist yet) and applies
+    the profile - or updates it in place if a role with that name already exists.
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true)]
+[CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = "ById")]
 param(
-    [Parameter(Position = 0)]
+    [Parameter(Position = 0, ParameterSetName = "ById")]
     [int] $RoleId = 8,
+
+    [Parameter(Mandatory, ParameterSetName = "ByName")]
+    [ValidateNotNullOrEmpty()]
+    [string] $RoleName,
+
+    [Parameter(ParameterSetName = "ByName")]
+    [string] $Description = "",
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
@@ -166,9 +188,9 @@ foreach ($t in $desiredTokens) { [void]$desiredSet.Add($t) }
 # =============================================================================
 # HTTP client
 # =============================================================================
-$baseUrl   = "https://$Region.ninjarmm.com"
-$roleUri   = "$baseUrl/swb/s6/user-roles/$RoleId"
-$userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
+$baseUrl       = "https://$Region.ninjarmm.com"
+$rolesEndpoint = "$baseUrl/swb/s6/user-roles"
+$userAgent     = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
 
 # .NET HttpClient with AllowAutoRedirect=$false keeps the session cookie off any http:// redirect
 # hop and returns 3xx cleanly (no PS 7.4+ insecure-redirect exception).
@@ -221,28 +243,69 @@ function Invoke-NinjaApi {
 }
 
 Write-Host "Target: $baseUrl"
-Write-Host ("Role id: {0}   Profile: {1} ({2} grants)" -f $RoleId, $ProfileName, $desiredTokens.Count)
+Write-Host ("Profile: {0} ({1} grants)" -f $ProfileName, $desiredTokens.Count)
 Write-Host ""
 
 # =============================================================================
-# Load the current role (to preserve name/type/description/members and diff)
+# Resolve the target role: existing (by id, or found by name) vs. create (by name)
 # =============================================================================
-$getResp = Invoke-NinjaApi -Method "GET" -Uri $roleUri
-if ($getResp.Code -ge 400) {
-    throw "Could not load role $RoleId (HTTP $($getResp.Code)). Session key expired or wrong id? Response: $($getResp.Body)"
-}
-$role = $getResp.Body | ConvertFrom-Json
-
-if ($role.type -ne "TECHNICIAN") {
-    throw "Role $RoleId is type '$($role.type)', not TECHNICIAN. Refusing to touch it."
-}
-
-Write-Host ("Role: '{0}' (type {1}, members: {2})" -f $role.name, $role.type, @($role.members).Count)
-
-# Current grants as an "ENTITY|name" set (only the allowed ones).
+# $isCreate drives whether we POST a new role first; $role carries the envelope
+# (name/type/description/members) and $currentSet the grants we are diffing against.
+$isCreate   = $false
+$role       = $null
 $currentSet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-foreach ($p in @($role.permissions)) {
-    if ($p.allowed) { [void]$currentSet.Add(("{0}|{1}" -f $p.entityType, $p.name)) }
+
+if ($PSCmdlet.ParameterSetName -eq "ByName") {
+    # List technician roles and look for an exact (case-insensitive) name match.
+    $listUri  = "$rolesEndpoint`?roleType=TECHNICIAN"
+    $listResp = Invoke-NinjaApi -Method "GET" -Uri $listUri
+    if ($listResp.Code -ge 400) {
+        throw "Could not list technician roles (HTTP $($listResp.Code)). Session key expired? Response: $($listResp.Body)"
+    }
+    $techRoles   = @($listResp.Body | ConvertFrom-Json)
+    $nameMatches = @($techRoles | Where-Object { $_.type -eq "TECHNICIAN" -and $_.name -eq $RoleName })
+    if ($nameMatches.Count -gt 1) {
+        $ids = ($nameMatches | ForEach-Object { $_.id }) -join ", "
+        throw "Found $($nameMatches.Count) technician roles named '$RoleName' (ids: $ids). Target one by -RoleId instead."
+    }
+    if ($nameMatches.Count -eq 1) {
+        $RoleId = [int]$nameMatches[0].id
+        Write-Host ("Found existing technician role '{0}' (id {1}) - will update it." -f $RoleName, $RoleId)
+    }
+    else {
+        $isCreate = $true
+        Write-Host ("No technician role named '{0}' yet - will create it (POST)." -f $RoleName)
+    }
+}
+
+if ($isCreate) {
+    # Fresh role: no current grants, empty member list, envelope built from the parameters.
+    $role = [pscustomobject]@{
+        name        = $RoleName
+        type        = "TECHNICIAN"
+        description = $Description
+        members     = @()
+    }
+}
+else {
+    # Load the existing role to preserve name/type/description/members and to diff.
+    $roleUri = "$rolesEndpoint/$RoleId"
+    $getResp = Invoke-NinjaApi -Method "GET" -Uri $roleUri
+    if ($getResp.Code -ge 400) {
+        throw "Could not load role $RoleId (HTTP $($getResp.Code)). Session key expired or wrong id? Response: $($getResp.Body)"
+    }
+    $role = $getResp.Body | ConvertFrom-Json
+
+    if ($role.type -ne "TECHNICIAN") {
+        throw "Role $RoleId is type '$($role.type)', not TECHNICIAN. Refusing to touch it."
+    }
+
+    Write-Host ("Role: '{0}' (id {1}, type {2}, members: {3})" -f $role.name, $RoleId, $role.type, @($role.members).Count)
+
+    # Current grants as an "ENTITY|name" set (only the allowed ones).
+    foreach ($p in @($role.permissions)) {
+        if ($p.allowed) { [void]$currentSet.Add(("{0}|{1}" -f $p.entityType, $p.name)) }
+    }
 }
 
 # Diff current -> desired.
@@ -268,24 +331,58 @@ if ($toRemove.Count -gt 0) {
 Write-Host ""
 
 # =============================================================================
-# Apply: PUT the whole role back with the desired permission set
+# Apply: (create the role first if needed) then PUT the full role with the grants
 # =============================================================================
-# Preserve the role envelope (name/type/description/members); replace permissions +
-# globalPermissions. members are round-tripped untouched so we never deassign anyone.
-$payload = [ordered]@{
-    name              = $role.name
-    type              = $role.type
-    description       = $role.description
-    permissions       = @($desiredPermissions)
-    members           = @($role.members)
-    globalPermissions = @()
+# Save is a full replace: the PUT carries the entire role envelope (name/type/description/
+# members) and the desired permission set. members are round-tripped untouched so we never
+# deassign anyone. A create is two steps: POST an empty role to mint the id, then PUT the grants
+# (POSTing permissions inline is not a verified contract, so we keep the two calls separate).
+$action = if ($isCreate) {
+    "CREATE technician role '{0}' then PUT {1} grants" -f $role.name, $desiredTokens.Count
+} else {
+    "PUT {0} grants (add {1}, remove {2})" -f $desiredTokens.Count, $toAdd.Count, $toRemove.Count
 }
-$body = $payload | ConvertTo-Json -Depth 10 -Compress
 
-if ($PSCmdlet.ShouldProcess($role.name, "PUT $roleUri ($($desiredTokens.Count) grants)")) {
+if ($PSCmdlet.ShouldProcess($role.name, $action)) {
+    if ($isCreate) {
+        # Mint the role with an empty permission list; the body of the response is the new id.
+        $createBody = [ordered]@{
+            name              = $role.name
+            type              = $role.type
+            description       = $role.description
+            permissions       = @()
+            members           = @()
+            globalPermissions = @()
+        } | ConvertTo-Json -Depth 10 -Compress
+
+        $cr = Invoke-NinjaApi -Method "POST" -Uri $rolesEndpoint -Body $createBody
+        if ($cr.Code -ge 400) {
+            Write-Host ("[ERROR {0}] Create (POST) failed - {1}" -f $cr.Code, $cr.Body) -ForegroundColor Red
+            exit 1
+        }
+        $newId = ($cr.Body).Trim().Trim('"')
+        if ($newId -notmatch '^\d+$') {
+            throw "Create succeeded (HTTP $($cr.Code)) but the response was not a role id: '$($cr.Body)'."
+        }
+        $RoleId = [int]$newId
+        Write-Host ("[OK {0}] Created technician role '{1}' (id {2})." -f $cr.Code, $role.name, $RoleId) -ForegroundColor Green
+    }
+
+    $roleUri = "$rolesEndpoint/$RoleId"
+    $payload = [ordered]@{
+        name              = $role.name
+        type              = $role.type
+        description       = $role.description
+        permissions       = @($desiredPermissions)
+        members           = @($role.members)
+        globalPermissions = @()
+    }
+    $body = $payload | ConvertTo-Json -Depth 10 -Compress
+
     $r = Invoke-NinjaApi -Method "PUT" -Uri $roleUri -Body $body
     if ($r.Code -lt 400) {
-        Write-Host ("[OK {0}] Applied '{1}' profile to role '{2}'." -f $r.Code, $ProfileName, $role.name) -ForegroundColor Green
+        $verb = if ($isCreate) { "Created and applied" } else { "Applied" }
+        Write-Host ("[OK {0}] {1} '{2}' profile to role '{3}' (id {4})." -f $r.Code, $verb, $ProfileName, $role.name, $RoleId) -ForegroundColor Green
         Write-Host ""
         Write-Host ("Done. Added: {0}, Removed: {1}, Total grants now: {2}." -f `
             $toAdd.Count, $toRemove.Count, $desiredTokens.Count)
@@ -296,6 +393,11 @@ if ($PSCmdlet.ShouldProcess($role.name, "PUT $roleUri ($($desiredTokens.Count) g
     }
 }
 else {
-    Write-Host ("[WhatIf] would PUT {0} grants to role '{1}' (add {2}, remove {3})." -f `
-        $desiredTokens.Count, $role.name, $toAdd.Count, $toRemove.Count)
+    if ($isCreate) {
+        Write-Host ("[WhatIf] would CREATE technician role '{0}' then PUT {1} grants." -f $role.name, $desiredTokens.Count)
+    }
+    else {
+        Write-Host ("[WhatIf] would PUT {0} grants to role '{1}' (add {2}, remove {3})." -f `
+            $desiredTokens.Count, $role.name, $toAdd.Count, $toRemove.Count)
+    }
 }

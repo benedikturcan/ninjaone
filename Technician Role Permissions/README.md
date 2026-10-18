@@ -1,7 +1,8 @@
 # Technician Role Permissions
 
 One PowerShell script that applies a least-privilege permission profile to a NinjaOne **technician
-role** in a single run. Ships with a ready-made **1st Level Support** profile.
+role** in a single run - it can **update an existing** role or **create a new one**. Ships with a
+ready-made **1st Level Support** profile.
 
 One script: [`Set-NinjaTechnicianRole.ps1`](Set-NinjaTechnicianRole.ps1).
 
@@ -12,14 +13,20 @@ One script: [`Set-NinjaTechnicianRole.ps1`](Set-NinjaTechnicianRole.ps1).
 - Authenticates with a **session cookie** (`sessionKey`) from a logged-in browser session.
 - **The session key is NOT stored in the script.** It comes from the `NINJA_SESSION_KEY`
   environment variable or the `-SessionKey` parameter.
-- `GET`s the role, then `PUT`s the whole role back with the desired grants. The role envelope
-  (name / type / description / **members**) is preserved - members are never deassigned.
+- **Two ways to target a role:**
+  - `-RoleId <n>` - update an **existing** role you know by id (default: `8`).
+  - `-RoleName "<name>"` - **create-or-update by name**: if a technician role with that name
+    exists it is updated, otherwise a new one is **created** (`POST`) and the profile applied.
+- Save is a full replace: it `GET`s the role (or `POST`s a new one), then `PUT`s the whole role
+  back with the desired grants. The role envelope (name / type / description / **members**) is
+  preserved - members are never deassigned.
 - Idempotent: if the role already carries exactly the profile, the `PUT` is skipped. `-WhatIf`
-  prints the add/remove diff and sends nothing.
+  prints the add/remove diff (and whether it would create) and sends nothing.
 
 ```powershell
 $env:NINJA_SESSION_KEY = "<sessionKey-from-browser>"
-.\Set-NinjaTechnicianRole.ps1          # applies "1st-level-support" to role id 8
+.\Set-NinjaTechnicianRole.ps1                               # update role id 8
+.\Set-NinjaTechnicianRole.ps1 -RoleName "1st Level Support" # create it if missing, else update
 ```
 
 ---
@@ -46,6 +53,23 @@ type and are intentionally **not** stored, so they don't appear in the list.
 The save is a full replace: `PUT /swb/s6/user-roles/{id}` always carries the **entire** permission
 list (there is no partial PATCH). That's why the script GETs first and round-trips name / type /
 description / members unchanged.
+
+---
+
+## Update vs. create
+
+- **Update (`-RoleId`, default).** The script `GET`s role `{id}`, refuses it unless its `type` is
+  `TECHNICIAN`, diffs the current grants against the profile and `PUT`s the role back.
+- **Create-or-update (`-RoleName`).** The script lists technician roles
+  (`GET /swb/s6/user-roles?roleType=TECHNICIAN`) and looks for an exact name match:
+  - **match found** → it updates that role in place (same as `-RoleId`).
+  - **no match** → it **creates** the role: `POST /swb/s6/user-roles` with the envelope and an
+    empty permission list mints the new id, then a `PUT` applies the profile grants. (Permissions
+    are not sent inline on the `POST` - that contract isn't verified, so create is two calls.)
+  - **more than one match** → it aborts and asks you to target by `-RoleId` (ambiguous name).
+
+Use `-Description` with `-RoleName` to set the description of a freshly created role (it is ignored
+when an existing role is updated).
 
 ---
 
@@ -99,10 +123,17 @@ Apply the 1st Level Support profile to the default role id (8):
 .\Set-NinjaTechnicianRole.ps1
 ```
 
-Dry run - show which grants would be added/removed, send nothing:
+Create the role if it does not exist yet (else update it), targeting by name:
+
+```powershell
+.\Set-NinjaTechnicianRole.ps1 -RoleName "1st Level Support" -Description "L1 helpdesk"
+```
+
+Dry run - show which grants would be added/removed (and whether it would create), send nothing:
 
 ```powershell
 .\Set-NinjaTechnicianRole.ps1 -RoleId 8 -WhatIf
+.\Set-NinjaTechnicianRole.ps1 -RoleName "1st Level Support" -WhatIf
 ```
 
 A different role id, one-off session key, different instance:
@@ -115,13 +146,17 @@ A different role id, one-off session key, different instance:
 
 ## Parameters
 
+`-RoleId` and `-RoleName` are mutually exclusive (separate parameter sets) - use one or the other.
+
 | Parameter | Required | Default | Description |
 | --- | --- | --- | --- |
-| `-RoleId` | no | `8` | Numeric id of the technician role (from the role editor URL `#/editor/role/<id>/...`) |
+| `-RoleId` | no | `8` | Numeric id of an **existing** technician role to update (from the role editor URL `#/editor/role/<id>/...`) |
+| `-RoleName` | no | - | Target a role **by name**: update it if it exists, otherwise **create** it (`POST`). Mutually exclusive with `-RoleId` |
+| `-Description` | no | `""` | Description for a role **created** via `-RoleName` (ignored when updating an existing role) |
 | `-ProfileName` | no | `1st-level-support` | Which profile from the built-in `$Profiles` catalog to apply |
 | `-SessionKey` | no | `$env:NINJA_SESSION_KEY` | Session cookie value. If both are missing, the script aborts with a clear message |
 | `-Region` | no | `eu` | Instance subdomain (`eu` -> `eu.ninjarmm.com`) |
-| `-WhatIf` | no | - | Dry run, prints the diff, sends no request |
+| `-WhatIf` | no | - | Dry run, prints the diff (and whether it would create), sends no request |
 
 ---
 
@@ -133,19 +168,28 @@ redirect.
 
 - `GET /swb/s6/user-roles/{id}` - read the current role (name, type, description, members,
   permissions, globalPermissions).
+- `GET /swb/s6/user-roles?roleType=TECHNICIAN` - list technician roles (`{ id, name, type }`) to
+  resolve `-RoleName` to an id (or decide to create). Used only in the `-RoleName` path.
+- **Create** a role: `POST /swb/s6/user-roles` with
+  `{ "name", "type":"TECHNICIAN", "description", "permissions":[], "members":[], "globalPermissions":[] }`.
+  Returns `200` with the **new role id** as the plain-text body. Used only when `-RoleName` finds
+  no existing role.
 - **Save** the role: `PUT /swb/s6/user-roles/{id}` with
   `{ "name", "type", "description", "permissions":[…], "members":[…], "globalPermissions":[] }`.
   Returns `204 No Content`.
 
-The script only touches `TECHNICIAN` roles (it refuses any other type) and replaces
-`permissions` + `globalPermissions` while preserving the rest of the envelope.
+The script only touches `TECHNICIAN` roles (it refuses any other type, and always creates with
+`type":"TECHNICIAN"`) and replaces `permissions` + `globalPermissions` while preserving the rest
+of the envelope.
 
 ---
 
 ## Safety
 
 - Idempotent: re-running after a successful apply reports "nothing to do".
+- `-RoleName` never creates a duplicate: it updates an existing same-named role, and refuses to
+  act if more than one role already carries that name (asks you to target by `-RoleId`).
 - `members` are round-tripped from the GET, so applying a profile never removes assigned
   technicians from the role.
-- `-WhatIf` shows the full add/remove diff before anything is sent.
+- `-WhatIf` shows the full add/remove diff (and whether it would create) before anything is sent.
 - Refuses to run against a role whose `type` is not `TECHNICIAN`.
