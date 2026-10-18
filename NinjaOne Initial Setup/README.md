@@ -2,7 +2,8 @@
 
 One PowerShell script that bootstraps a fresh NinjaOne tenant in a single run: it creates the
 custom **node roles** and the matching **policy hierarchy** (default-policy naming convention +
-child policies) from the same `-Roles` selection.
+child policies) from a `-Roles` selection, and the **technician permission roles** (1st/2nd/3rd
+Level Support + Sys Admin) from a `-TechnicianRoles` selection.
 
 One script: [`Initialize-NinjaTenant.ps1`](Initialize-NinjaTenant.ps1).
 
@@ -13,20 +14,24 @@ One script: [`Initialize-NinjaTenant.ps1`](Initialize-NinjaTenant.ps1).
 - Authenticates with a **session cookie** (`sessionKey`) from a logged-in browser session.
 - **The session key is NOT stored in the script.** It comes from the `NINJA_SESSION_KEY`
   environment variable or the `-SessionKey` parameter.
-- `-Roles` is **optional** and drives everything: `server-all` for all server roles, or individual
-  short keys (`sql,terminal`, …).
-- Three passes in one run:
+- `-Roles` and `-TechnicianRoles` are both **optional**: `-Roles server-all` for all server roles
+  (or short keys `sql,terminal`, …); `-TechnicianRoles tech-all` for all four technician profiles
+  (or individual keys).
+- Four passes in one run:
   1. **Node roles** (only with `-Roles`): one custom node role per selected role.
-  2. **Default policy naming** (**always**): renames every built-in default policy to the
-     convention (`0.0`, `1.0`, `2.0`, …), so the hierarchy stays consistent even without roles.
+  2. **Default policy naming** (with `-Roles`, or on a bare call): renames every built-in default
+     policy to the convention (`0.0`, `1.0`, `2.0`, …). Skipped on a technician-roles-only run.
   3. **Child policies** (only with `-Roles`): one child policy per selected role, inheriting from
      its default.
-- Idempotent: existing roles, already-renamed defaults and already-existing children are skipped.
-  `-WhatIf` for a safe dry run.
+  4. **Technician roles** (only with `-TechnicianRoles`): create-or-update one technician role per
+     selected permission profile.
+- Idempotent: existing roles, already-renamed defaults, already-existing children and technician
+  roles already carrying their profile are skipped. `-WhatIf` for a safe dry run.
 
 ```powershell
 $env:NINJA_SESSION_KEY = "<sessionKey-from-browser>"
 .\Initialize-NinjaTenant.ps1 -Roles server-all
+.\Initialize-NinjaTenant.ps1 -TechnicianRoles tech-all
 ```
 
 ---
@@ -59,6 +64,39 @@ $env:NINJA_SESSION_KEY = "<sessionKey-from-browser>"
 | `server-all` | `datev, sql, terminal, application, file` |
 | `workstation-all` | `homeoffice, vip` |
 | `testlab` | `testserver, testworkstation` |
+
+---
+
+## Technician roles
+
+`-TechnicianRoles` create-or-updates NinjaOne **technician** roles from four built-in permission
+profiles, captured 1:1 from the live permission editor and forming a strict escalation
+(**L1 ⊆ L2 ⊆ L3 ⊆ Sys Admin**). Each profile maps to a fixed role name:
+
+| Profile key (`-TechnicianRoles`) | Role created/updated | Grants | For whom |
+| --- | --- | --- | --- |
+| `1st-level-support` | 1st Level Support | 27 | Helpdesk / dispatch - read + run + ticket handling |
+| `2nd-level-support` | 2nd Level Support | 92 | Field technician - remediate devices, author scripts & docs |
+| `3rd-level-support` | 3rd Level Support | 150 | Senior / escalation engineer - full operations, no platform admin |
+| `system-administrator` | Sys Admin | 208 | The complete catalog - replaces the breakglass System Administrator |
+
+**Group keyword:** `tech-all` expands to all four profiles.
+
+A technician role's permissions are a **flat list of grants** (`{ entityId, entityType, name,
+allowed }`). An access level like "View, run" is stored as **two** grants (`NODE|View` + `NODE|Run`),
+and every allowed remote tool / remote-access app is its own grant. The save is a full replace
+(`PUT /swb/s6/user-roles/{id}`), so Pass 4 GETs the role first (or POSTs a new one) and round-trips
+its name / type / description / **members** - applying a profile never deassigns technicians. NinjaOne
+has no custom "System Administrator" *role type*, so `system-administrator` is a `TECHNICIAN` role
+granted every permission.
+
+```powershell
+.\Initialize-NinjaTenant.ps1 -TechnicianRoles system-administrator   # just the Sys Admin role
+.\Initialize-NinjaTenant.ps1 -TechnicianRoles tech-all               # all four roles
+```
+
+The exact grant lists live in the `$TechnicianRoleCatalog` near the top of the script - edit that
+catalog (or add another named profile) to change what gets applied, no other code changes needed.
 
 ---
 
@@ -143,6 +181,18 @@ Dry run - shows the planned roles, renames and child creates, sends nothing:
 .\Initialize-NinjaTenant.ps1 -Roles server-all -WhatIf
 ```
 
+Technician roles only (no device roles, no policy renames):
+
+```powershell
+.\Initialize-NinjaTenant.ps1 -TechnicianRoles tech-all
+```
+
+Everything in one run - device roles, policy hierarchy and technician roles:
+
+```powershell
+.\Initialize-NinjaTenant.ps1 -Roles server-all -TechnicianRoles tech-all
+```
+
 Session key for a single run, and a different instance:
 
 ```powershell
@@ -156,6 +206,7 @@ Session key for a single run, and a different instance:
 | Parameter | Required | Default | Description |
 | --- | --- | --- | --- |
 | `-Roles` | no | (none) | Group keywords (`server-all`, `workstation-all`, `testlab`) and/or short keys (`datev,sql,terminal,…`). Omit to only enforce the default-policy naming convention |
+| `-TechnicianRoles` | no | (none) | Technician permission profiles: `1st-level-support`, `2nd-level-support`, `3rd-level-support`, `system-administrator`, or the group `tech-all`. Create-or-update by name |
 | `-SessionKey` | no | `$env:NINJA_SESSION_KEY` | Session cookie value. If both are missing, the script aborts with a clear message |
 | `-Region` | no | `eu` | Instance subdomain (`eu` -> `eu.ninjarmm.com`) |
 | `-WhatIf` | no | - | Dry run, sends no request |
@@ -178,6 +229,15 @@ redirect.
 
 A child policy links to its parent **only** via `parentPolicyId` and inherits all settings - it
 is not tied to the custom node role, so the policy passes don't depend on the node-role pass.
+
+Technician roles (Pass 4):
+
+- `GET /swb/s6/user-roles?roleType=TECHNICIAN` - list existing technician roles (resolve by name).
+- `GET /swb/s6/user-roles/{id}` - read a role before updating (round-trips name / type /
+  description / members so a profile apply never deassigns technicians).
+- **Create** a role: `POST /swb/s6/user-roles` to mint an id, then **replace** its permissions.
+- **Save** permissions: `PUT /swb/s6/user-roles/{id}` - a **full replace** of the grant list, not a
+  partial patch.
 
 ---
 
@@ -205,6 +265,12 @@ custom role hangs under), already known from `GET /swb/s6/noderole/list`:
 macOS/Linux roles are **not defined yet** (no names decided) - the catalog has commented
 placeholders. Adding one later is a single catalog line; its category already has a reserved
 major number and base name in `$CategoryMeta`.
+
+To change the **technician** roles, edit the two catalogs near the top of the script instead:
+
+- **`$TechnicianRoleCatalog`** - one entry per profile (`key = @{ roleName; grants }`), where
+  `grants` is the flat list of `ENTITY|name` tokens applied to the role.
+- **`$TechnicianRoleGroups`** - group keywords that expand to several profiles (e.g. `tech-all`).
 
 ---
 
