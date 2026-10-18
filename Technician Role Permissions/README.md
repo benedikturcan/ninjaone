@@ -1,8 +1,9 @@
 # Technician Role Permissions
 
-One PowerShell script that applies a least-privilege permission profile to a NinjaOne **technician
-role** in a single run - it can **update an existing** role or **create a new one**. Ships with a
-ready-made **1st Level Support** profile.
+One PowerShell script that applies a permission profile to a NinjaOne **technician role** in a
+single run - it can **update an existing** role or **create a new one**. Ships with four ready-made
+profiles: escalating least-privilege **1st / 2nd / 3rd Level Support**, plus a full-access
+**Sys Admin** profile that carries every captured grant.
 
 One script: [`Set-NinjaTechnicianRole.ps1`](Set-NinjaTechnicianRole.ps1).
 
@@ -23,10 +24,15 @@ One script: [`Set-NinjaTechnicianRole.ps1`](Set-NinjaTechnicianRole.ps1).
 - Idempotent: if the role already carries exactly the profile, the `PUT` is skipped. `-WhatIf`
   prints the add/remove diff (and whether it would create) and sends nothing.
 
+- Four built-in profiles via `-ProfileName`: `1st-level-support` (default), `2nd-level-support`,
+  `3rd-level-support`, `system-administrator`. L1 ⊆ L2 ⊆ L3 ⊆ Sys Admin.
+
 ```powershell
 $env:NINJA_SESSION_KEY = "<sessionKey-from-browser>"
-.\Set-NinjaTechnicianRole.ps1                               # update role id 8
+.\Set-NinjaTechnicianRole.ps1                               # update role id 8 with 1st-level-support
 .\Set-NinjaTechnicianRole.ps1 -RoleName "1st Level Support" # create it if missing, else update
+.\Set-NinjaTechnicianRole.ps1 -RoleName "2nd Level Support" -ProfileName 2nd-level-support
+.\Set-NinjaTechnicianRole.ps1 -RoleName "Sys Admin"         -ProfileName system-administrator
 ```
 
 ---
@@ -73,9 +79,22 @@ when an existing role is updated).
 
 ---
 
-## The "1st Level Support" profile
+## The built-in profiles
 
-A least-privilege profile for a 1st Level Support technician:
+Four profiles ship in the `$Profiles` catalog, forming a strict escalation
+(**L1 ⊆ L2 ⊆ L3 ⊆ Sys Admin**). Every grant was captured from the live permission editor, so each
+token maps to a real control in the UI.
+
+| Profile (`-ProfileName`) | Grants | For whom |
+| --- | --- | --- |
+| `1st-level-support` | 27 | Helpdesk / dispatch - read + run + ticket handling |
+| `2nd-level-support` | 92 | Field technician - remediate devices, author scripts & docs |
+| `3rd-level-support` | 150 | Senior / escalation engineer - full operations, no platform admin |
+| `system-administrator` | 208 | **Sys Admin** - the complete catalog (replaces breakglass) |
+
+### 1st Level Support (`1st-level-support`)
+
+A least-privilege helpdesk profile:
 
 | Area | What the profile grants |
 | --- | --- |
@@ -91,7 +110,51 @@ A least-privilege profile for a 1st Level Support technician:
 Everything else (uninstall software/patch, backup, SNMP, billing, MDM, approvals, delete anywhere,
 admin toggles) is left at **No access**.
 
-The exact grant list lives in the `$Profiles` catalog near the top of the script. Edit that catalog
+### 2nd Level Support (`2nd-level-support`)
+
+Everything L1 can do, **plus** the ability to actually remediate:
+
+| Area | Added on top of L1 |
+| --- | --- |
+| **Devices** | Update, decommission, device approvals, remote registry, secure fields + TOTP |
+| **Automation Library** | Create / update scripts, full scheduled-task management |
+| **Ticketing** | Private comments, edit all comments, board view, SLA, time tracked, no-org tickets |
+| **Documentation** | Create / update KB, docs, templates and checklists (no delete, no publishing config) |
+| **IT Asset Management** | Create / update software licenses, asset attributes and relationships (no delete) |
+| **System** | Backup view/manage/restore, uninstall software & patches, maintenance mode, device administration, related items, vulnerability view, full reports, discovered-asset view |
+
+Still **read-only** on organizations & policies, and **no tenant administration**.
+
+### 3rd Level Support (`3rd-level-support`)
+
+A senior escalation engineer - full operational control:
+
+| Area | Added on top of L2 |
+| --- | --- |
+| **Devices** | Create + delete (full lifecycle) |
+| **Organizations / Policies** | Create + update (**not** delete) |
+| **Automation Library** | Delete scripts |
+| **Ticketing** | Delete tickets, ticketing configuration, pending-email boards |
+| **Approvals / AI** | Ticketing + administrative approvals, AI / MCP access |
+| **Documentation / ITAM** | Full create/update/**delete**, public links, relationship types |
+| **System** | Contact/related-item/discovered-asset/custom-field/tag administration, AD discovery, manager views, custom SNMP update |
+
+Deliberately **withholds platform administration** (reserved for Sys Admin): RBAC role
+administration, integration/MDM/PSA/SaaS-backup/SIEM configuration, caching, custom tabs, and
+destructive deletion of organizations/policies.
+
+### Sys Admin (`system-administrator`)
+
+The **complete captured catalog** - all 208 grants across every entity type. Intended to **replace
+the built-in breakglass System Administrator** for day-to-day tenant administration (NinjaOne has no
+custom "System Administrator" *role type*, so this is a `TECHNICIAN` role granted every permission).
+Apply it to a role named **Sys Admin**:
+
+```powershell
+.\Set-NinjaTechnicianRole.ps1 -RoleName "Sys Admin" -ProfileName system-administrator
+```
+
+The exact grant lists live in the `$Profiles` catalog near the top of the script. Edit that catalog
 (or add another named profile) to change what gets applied - no other code changes needed.
 
 ---
@@ -129,6 +192,14 @@ Create the role if it does not exist yet (else update it), targeting by name:
 .\Set-NinjaTechnicianRole.ps1 -RoleName "1st Level Support" -Description "L1 helpdesk"
 ```
 
+Create (or update) the L2, L3 and Sys Admin roles with their matching profiles:
+
+```powershell
+.\Set-NinjaTechnicianRole.ps1 -RoleName "2nd Level Support" -ProfileName 2nd-level-support
+.\Set-NinjaTechnicianRole.ps1 -RoleName "3rd Level Support" -ProfileName 3rd-level-support
+.\Set-NinjaTechnicianRole.ps1 -RoleName "Sys Admin"         -ProfileName system-administrator
+```
+
 Dry run - show which grants would be added/removed (and whether it would create), send nothing:
 
 ```powershell
@@ -153,7 +224,7 @@ A different role id, one-off session key, different instance:
 | `-RoleId` | no | `8` | Numeric id of an **existing** technician role to update (from the role editor URL `#/editor/role/<id>/...`) |
 | `-RoleName` | no | - | Target a role **by name**: update it if it exists, otherwise **create** it (`POST`). Mutually exclusive with `-RoleId` |
 | `-Description` | no | `""` | Description for a role **created** via `-RoleName` (ignored when updating an existing role) |
-| `-ProfileName` | no | `1st-level-support` | Which profile from the built-in `$Profiles` catalog to apply |
+| `-ProfileName` | no | `1st-level-support` | Which profile from the built-in `$Profiles` catalog to apply: `1st-level-support`, `2nd-level-support`, `3rd-level-support`, `system-administrator` |
 | `-SessionKey` | no | `$env:NINJA_SESSION_KEY` | Session cookie value. If both are missing, the script aborts with a clear message |
 | `-Region` | no | `eu` | Instance subdomain (`eu` -> `eu.ninjarmm.com`) |
 | `-WhatIf` | no | - | Dry run, prints the diff (and whether it would create), sends no request |

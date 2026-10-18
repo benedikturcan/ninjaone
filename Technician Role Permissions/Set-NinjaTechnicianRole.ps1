@@ -1,7 +1,8 @@
 <#
 .SYNOPSIS
-    Sets the permission set of a NinjaOne technician role in one run - ships a least-privilege
-    "1st Level Support" permission profile and applies it with a single PUT.
+    Sets the permission set of a NinjaOne technician role in one run - ships escalating
+    least-privilege "1st / 2nd / 3rd Level Support" profiles plus a full-access "Sys Admin"
+    profile, and applies the chosen one with a single PUT.
 
 .DESCRIPTION
     Talks to the internal /swb/s6/user-roles/{id} endpoint the web UI uses, authenticated with a
@@ -17,9 +18,10 @@
     set. Role-type default grants (e.g. "View and add public comments") are implied by the role
     type and are intentionally NOT stored, so they do not appear in the list.
 
-    The built-in $Profiles catalog holds the "1st Level Support" permission set captured from the
-    web UI. Adjust that catalog (or add another named profile) to change what gets applied - no
-    other code changes needed.
+    The built-in $Profiles catalog holds four permission sets captured from the web UI:
+    "1st-level-support", "2nd-level-support" and "3rd-level-support" (escalating least-privilege),
+    and "system-administrator" (the complete captured catalog - ALL grants). Adjust that catalog
+    (or add another named profile) to change what gets applied - no other code changes needed.
 
     Idempotent and -WhatIf-safe: if the role already carries exactly the desired grants the PUT is
     skipped, and -WhatIf prints the add/remove diff without sending anything.
@@ -43,6 +45,8 @@
 
 .PARAMETER ProfileName
     Which permission profile from the built-in catalog to apply. Default: "1st-level-support".
+    Valid values: "1st-level-support", "2nd-level-support", "3rd-level-support",
+    "system-administrator".
 
 .PARAMETER SessionKey
     The sessionKey cookie value from the logged-in NinjaOne browser session.
@@ -72,6 +76,15 @@
     .\Set-NinjaTechnicianRole.ps1 -RoleName "1st Level Support" -Description "L1 helpdesk"
     Creates a technician role named "1st Level Support" (if it does not exist yet) and applies
     the profile - or updates it in place if a role with that name already exists.
+
+.EXAMPLE
+    .\Set-NinjaTechnicianRole.ps1 -RoleName "2nd Level Support" -ProfileName 2nd-level-support
+    Creates (or updates) a "2nd Level Support" technician role with the escalated L2 profile.
+
+.EXAMPLE
+    .\Set-NinjaTechnicianRole.ps1 -RoleName "Sys Admin" -ProfileName system-administrator
+    Creates (or updates) a full-access "Sys Admin" technician role carrying every captured grant,
+    intended to replace the built-in breakglass System Administrator for day-to-day admin work.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, DefaultParameterSetName = "ById")]
@@ -168,6 +181,532 @@ $Profiles = [ordered]@{
         "SYSTEM|MobileApp.Access"
         "SYSTEM|Contact.View"
         "SYSTEM|Reports.ViewSchedule"
+    )
+
+    # ---------------------------------------------------------------------
+    # 2nd Level Support - escalation technician.
+    # Everything L1 can do, plus: remediate devices (update / decommission /
+    # device approvals / remote registry / secure fields), author scripts and
+    # scheduled tasks, edit documentation and IT asset data, and a broader
+    # ticketing surface (private comments, SLA, boards view, time tracked).
+    # Still read-only on organizations/policies and NO tenant administration.
+    # ---------------------------------------------------------------------
+    "2nd-level-support" = @(
+        # --- Devices (NODE): L1 remote toolkit + remediation ----------------
+        "NODE|View"
+        "NODE|Run"
+        "NODE|Update"
+        "NODE|Decommission.Access"
+        "NODE|NodeApproval.View"
+        "NODE|NodeApproval.Approve"
+        "NODE|NodeApproval.Reject"
+        "NODE|SecureFields.Access"
+        "NODE|TOTP.Code.Access"
+        "NODE|RemoteTools.TaskManager.Access"
+        "NODE|RemoteTools.FileExplorer.Access"
+        "NODE|RemoteTools.CommandLine.Access"
+        "NODE|RemoteTools.ServicesManager.Access"
+        "NODE|RemoteTools.RemoteRegistry.Access"
+        "NODE|RemoteAccess.Splashtop.Access"
+        "NODE|RemoteAccess.NinjaConnect.Access"
+
+        # --- Organizations / Policies (still read-only) ---------------------
+        "ORGANIZATION|View"
+        "POLICY|View"
+
+        # --- Automation Library: author + schedule --------------------------
+        "SCRIPT_CATEGORY|View"
+        "SCRIPT_CATEGORY|Run"
+        "SCRIPT_CATEGORY|Create"
+        "SCRIPT_CATEGORY|Update"
+        "SCRIPT_CATEGORY|Scheduled.Task.View"
+        "SCRIPT_CATEGORY|Scheduled.Task.Create"
+        "SCRIPT_CATEGORY|Scheduled.Task.Update"
+        "SCRIPT_CATEGORY|Scheduled.Task.Delete"
+
+        # --- Ticketing (broader than L1, no ticketing config) ---------------
+        "TICKETING|Ticket.View"
+        "TICKETING|Ticket.Create"
+        "TICKETING|Ticket.Update"
+        "TICKETING|Ticketing.Comment.Change.History.View"
+        "TICKETING|Ticketing.Relationship.View"
+        "TICKETING|Ticketing.Relationship.Manage"
+        "TICKETING|Ticketing.Mobile.Access"
+        "TICKETING|Private.Comments.View"
+        "TICKETING|Private.Comments.Update.Own"
+        "TICKETING|Private.Comments.Update.All"
+        "TICKETING|Ticketing.Comments.Update.Own"
+        "TICKETING|Ticketing.Comments.Update.All"
+        "TICKETING|Board.View"
+        "TICKETING|Ticketing.ServiceLevelAgreement.Access"
+        "TICKETING|Ticketing.RecentTicketsWidget.Access"
+        "TICKETING|Manage.Tickets.NoOrg.Access"
+        "TICKETING|TimeTracked.Update.All"
+
+        # --- Documentation: author (no delete / no publishing config) -------
+        "DOCUMENTATION|Global.KB.Management.View"
+        "DOCUMENTATION|Management.View"
+        "DOCUMENTATION|Template.View"
+        "DOCUMENTATION|Checklist.Management.View"
+        "DOCUMENTATION|Checklist.Management.Create"
+        "DOCUMENTATION|Checklist.Management.Update"
+        "DOCUMENTATION|Checklist.Template.View"
+        "DOCUMENTATION|Management.Create"
+        "DOCUMENTATION|Management.Update"
+        "DOCUMENTATION|Global.KB.Management.Create"
+        "DOCUMENTATION|Global.KB.Management.Update"
+        "DOCUMENTATION|Template.Create"
+        "DOCUMENTATION|Template.Update"
+        "DOCUMENTATION|Export.Access"
+        "DOCUMENTATION|Management.SecureFields.Access"
+
+        # --- IT Asset Management: edit (no delete / no type admin) ----------
+        "ITAM|Itam.SoftwareLicense.View"
+        "ITAM|Itam.CoreAssetAttribute.View"
+        "ITAM|Itam.CoreAssetAttribute.Update"
+        "ITAM|Itam.SoftwareLicense.Create"
+        "ITAM|Itam.SoftwareLicense.Update"
+        "ITAM|Itam.AssetRelationship.View"
+        "ITAM|Itam.AssetRelationship.Create"
+        "ITAM|Itam.AssetRelationship.Update"
+        "ITAM|Itam.RelationshipType.View"
+
+        # --- System: operational actions, no tenant/integration config -----
+        "SYSTEM|MobileApp.Access"
+        "SYSTEM|Contact.View"
+        "SYSTEM|Contact.Create"
+        "SYSTEM|Contact.Update"
+        "SYSTEM|Reports.ViewSchedule"
+        "SYSTEM|Reports.ViewClaimSchedule"
+        "SYSTEM|Reports.FullAccess"
+        "SYSTEM|Backup.View"
+        "SYSTEM|Backup.Manage"
+        "SYSTEM|Backup.Restore"
+        "SYSTEM|UninstallSoftware.Access"
+        "SYSTEM|UninstallPatch.Access"
+        "SYSTEM|MaintenanceMode.Editor.Access"
+        "SYSTEM|Device.Administration.Access"
+        "SYSTEM|RelatedItem.View"
+        "SYSTEM|RelatedItem.Create"
+        "SYSTEM|RelatedItem.Update"
+        "SYSTEM|RelatedItem.Credentials.Access"
+        "SYSTEM|Vulnerability.View"
+        "SYSTEM|Discovered.Asset.Management.View"
+        "SYSTEM|CustomFields.Administration.View"
+        "SYSTEM|BrowserManagement.View"
+        "SYSTEM|Itam.Tag.View"
+        "SYSTEM|Itam.Tag.Management.View"
+        "SYSTEM|CustomSNMP.View"
+    )
+
+    # ---------------------------------------------------------------------
+    # 3rd Level Support - senior / escalation engineer.
+    # Full operational control: device lifecycle (create/delete), create &
+    # update organizations and policies, full automation/documentation/ITAM,
+    # approvals, AI, discovered assets, custom fields and reporting.
+    # Deliberately withholds PLATFORM ADMINISTRATION (reserved for Sys Admin):
+    # RBAC role administration, integration/MDM/PSA/SaaS-backup/SIEM config,
+    # caching, custom tabs, and destructive deletion of orgs/policies.
+    # ---------------------------------------------------------------------
+    "3rd-level-support" = @(
+        # --- Global search --------------------------------------------------
+        "SEARCH|Search.Create"
+
+        # --- Devices (NODE): full lifecycle ---------------------------------
+        "NODE|View"
+        "NODE|Run"
+        "NODE|Create"
+        "NODE|Update"
+        "NODE|Delete"
+        "NODE|Decommission.Access"
+        "NODE|NodeApproval.View"
+        "NODE|NodeApproval.Approve"
+        "NODE|NodeApproval.Reject"
+        "NODE|SecureFields.Access"
+        "NODE|TOTP.Code.Access"
+        "NODE|RemoteTools.TaskManager.Access"
+        "NODE|RemoteTools.FileExplorer.Access"
+        "NODE|RemoteTools.CommandLine.Access"
+        "NODE|RemoteTools.ServicesManager.Access"
+        "NODE|RemoteTools.RemoteRegistry.Access"
+        "NODE|RemoteAccess.Splashtop.Access"
+        "NODE|RemoteAccess.NinjaConnect.Access"
+
+        # --- Organizations / Policies: create + update (NO delete) ----------
+        "ORGANIZATION|View"
+        "ORGANIZATION|Create"
+        "ORGANIZATION|Update"
+        "POLICY|View"
+        "POLICY|Create"
+        "POLICY|Update"
+
+        # --- Automation Library: full --------------------------------------
+        "SCRIPT_CATEGORY|View"
+        "SCRIPT_CATEGORY|Run"
+        "SCRIPT_CATEGORY|Create"
+        "SCRIPT_CATEGORY|Update"
+        "SCRIPT_CATEGORY|Delete"
+        "SCRIPT_CATEGORY|Scheduled.Task.View"
+        "SCRIPT_CATEGORY|Scheduled.Task.Create"
+        "SCRIPT_CATEGORY|Scheduled.Task.Update"
+        "SCRIPT_CATEGORY|Scheduled.Task.Delete"
+
+        # --- Ticketing: full, incl. boards + ticketing config ---------------
+        "TICKETING|Ticket.View"
+        "TICKETING|Ticket.Create"
+        "TICKETING|Ticket.Update"
+        "TICKETING|Ticket.Delete"
+        "TICKETING|Ticketing.Comment.Change.History.View"
+        "TICKETING|Ticketing.Relationship.View"
+        "TICKETING|Ticketing.Relationship.Manage"
+        "TICKETING|Ticketing.Mobile.Access"
+        "TICKETING|Private.Comments.View"
+        "TICKETING|Private.Comments.Update.Own"
+        "TICKETING|Private.Comments.Update.All"
+        "TICKETING|Ticketing.Comments.Update.Own"
+        "TICKETING|Ticketing.Comments.Update.All"
+        "TICKETING|Board.View"
+        "TICKETING|Ticketing.ServiceLevelAgreement.Access"
+        "TICKETING|Ticketing.RecentTicketsWidget.Access"
+        "TICKETING|Manage.Tickets.NoOrg.Access"
+        "TICKETING|TimeTracked.Update.All"
+        "TICKETING|Configuration.Ticketing.Access"
+        "TICKETING|PendingEmailBoard.View"
+        "TICKETING|PendingEmailBoard.Manage"
+
+        # --- Documentation: full -------------------------------------------
+        "DOCUMENTATION|Global.KB.Management.View"
+        "DOCUMENTATION|Global.KB.Management.Create"
+        "DOCUMENTATION|Global.KB.Management.Update"
+        "DOCUMENTATION|Global.KB.Management.Delete"
+        "DOCUMENTATION|Global.KB.EndUser.Folder.Share.Access"
+        "DOCUMENTATION|KB.Management.Access.Restriction.Access"
+        "DOCUMENTATION|KB.Management.Public.Links.View"
+        "DOCUMENTATION|KB.Management.Public.Links.Create"
+        "DOCUMENTATION|KB.Management.Public.Links.Update"
+        "DOCUMENTATION|KB.Management.Public.Links.Delete"
+        "DOCUMENTATION|Management.View"
+        "DOCUMENTATION|Management.Create"
+        "DOCUMENTATION|Management.Update"
+        "DOCUMENTATION|Management.Delete"
+        "DOCUMENTATION|Management.SecureFields.Access"
+        "DOCUMENTATION|Template.View"
+        "DOCUMENTATION|Template.Create"
+        "DOCUMENTATION|Template.Update"
+        "DOCUMENTATION|Template.Delete"
+        "DOCUMENTATION|Checklist.Management.View"
+        "DOCUMENTATION|Checklist.Management.Create"
+        "DOCUMENTATION|Checklist.Management.Update"
+        "DOCUMENTATION|Checklist.Management.Delete"
+        "DOCUMENTATION|Checklist.Template.View"
+        "DOCUMENTATION|Checklist.Template.Create"
+        "DOCUMENTATION|Checklist.Template.Update"
+        "DOCUMENTATION|Checklist.Template.Delete"
+        "DOCUMENTATION|Configuration.Access"
+        "DOCUMENTATION|Export.Access"
+        "DOCUMENTATION|TOTP.Code.Access"
+
+        # --- IT Asset Management: full -------------------------------------
+        "ITAM|Itam.SoftwareLicense.View"
+        "ITAM|Itam.SoftwareLicense.Create"
+        "ITAM|Itam.SoftwareLicense.Update"
+        "ITAM|Itam.SoftwareLicense.Delete"
+        "ITAM|Itam.CoreAssetAttribute.View"
+        "ITAM|Itam.CoreAssetAttribute.Update"
+        "ITAM|Itam.AssetRelationship.View"
+        "ITAM|Itam.AssetRelationship.Create"
+        "ITAM|Itam.AssetRelationship.Update"
+        "ITAM|Itam.AssetRelationship.Delete"
+        "ITAM|Itam.RelationshipType.View"
+        "ITAM|Itam.RelationshipType.Create"
+        "ITAM|Itam.RelationshipType.Update"
+        "ITAM|Itam.RelationshipType.Delete"
+
+        # --- Approvals + AI -------------------------------------------------
+        "APPROVAL_PROCESS|Approval.Process.Ticketing.Actions.Access"
+        "APPROVAL_PROCESS|Approval.Process.Administrative.Actions.Access"
+        "ARTIFICIAL_INTELLIGENCE|AI.MCP.Access"
+        "ARTIFICIAL_INTELLIGENCE|AI.Actions.MCP"
+
+        # --- System: operational + data admin (NO platform/integration cfg)-
+        "SYSTEM|MobileApp.Access"
+        "SYSTEM|Contact.View"
+        "SYSTEM|Contact.Create"
+        "SYSTEM|Contact.Update"
+        "SYSTEM|Contact.Delete"
+        "SYSTEM|Reports.ViewSchedule"
+        "SYSTEM|Reports.ViewClaimSchedule"
+        "SYSTEM|Reports.FullAccess"
+        "SYSTEM|Backup.View"
+        "SYSTEM|Backup.Manage"
+        "SYSTEM|Backup.Restore"
+        "SYSTEM|UninstallSoftware.Access"
+        "SYSTEM|UninstallPatch.Access"
+        "SYSTEM|MaintenanceMode.Editor.Access"
+        "SYSTEM|Device.Administration.Access"
+        "SYSTEM|RelatedItem.View"
+        "SYSTEM|RelatedItem.Create"
+        "SYSTEM|RelatedItem.Update"
+        "SYSTEM|RelatedItem.Delete"
+        "SYSTEM|RelatedItem.Credentials.Access"
+        "SYSTEM|Vulnerability.View"
+        "SYSTEM|Discovered.Asset.Management.View"
+        "SYSTEM|Discovered.Asset.Management.Create"
+        "SYSTEM|Discovered.Asset.Management.Update"
+        "SYSTEM|Discovered.Asset.Management.Delete"
+        "SYSTEM|CustomFields.Administration.View"
+        "SYSTEM|CustomFields.Administration.Create"
+        "SYSTEM|CustomFields.Administration.Update"
+        "SYSTEM|CustomFields.Administration.Delete"
+        "SYSTEM|CustomFields.Export.Access"
+        "SYSTEM|GlobalCustomFieldsManagement.Access"
+        "SYSTEM|BrowserManagement.View"
+        "SYSTEM|Itam.Tag.View"
+        "SYSTEM|Itam.Tag.Create"
+        "SYSTEM|Itam.Tag.Update"
+        "SYSTEM|Itam.Tag.Delete"
+        "SYSTEM|Itam.Tag.Management.View"
+        "SYSTEM|Itam.Tag.Management.Update"
+        "SYSTEM|CustomSNMP.View"
+        "SYSTEM|CustomSNMP.Update"
+        "SYSTEM|ActiveDirectoryDiscovery.Access"
+        "SYSTEM|Configuration.Activities.Access"
+        "SYSTEM|EndUserSharing.Access"
+        "SYSTEM|Manager.View"
+        "SYSTEM|Manager.Update"
+        "SYSTEM|Manager.UpdateSelfAccess"
+        "SYSTEM|NinjaConnect.BackgroundMode.Access"
+    )
+
+    # ---------------------------------------------------------------------
+    # System Administrator -> role name "Sys Admin".
+    # The complete captured permission catalog (ALL 208 grants across every
+    # entity type). Intended to REPLACE the built-in breakglass System
+    # Administrator for day-to-day tenant administration. Apply with:
+    #   .\Set-NinjaTechnicianRole.ps1 -RoleName "Sys Admin" -ProfileName system-administrator
+    # ---------------------------------------------------------------------
+    "system-administrator" = @(
+        # --- SEARCH ---
+        "SEARCH|Search.Create"
+        # --- NODE ---
+        "NODE|Create"
+        "NODE|Decommission.Access"
+        "NODE|Delete"
+        "NODE|NodeApproval.Approve"
+        "NODE|NodeApproval.Reject"
+        "NODE|NodeApproval.View"
+        "NODE|RemoteAccess.NinjaConnect.Access"
+        "NODE|RemoteAccess.Splashtop.Access"
+        "NODE|RemoteTools.CommandLine.Access"
+        "NODE|RemoteTools.FileExplorer.Access"
+        "NODE|RemoteTools.RemoteRegistry.Access"
+        "NODE|RemoteTools.ServicesManager.Access"
+        "NODE|RemoteTools.TaskManager.Access"
+        "NODE|Run"
+        "NODE|SecureFields.Access"
+        "NODE|TOTP.Code.Access"
+        "NODE|Update"
+        "NODE|View"
+        # --- ORGANIZATION ---
+        "ORGANIZATION|Create"
+        "ORGANIZATION|Delete"
+        "ORGANIZATION|Update"
+        "ORGANIZATION|View"
+        # --- POLICY ---
+        "POLICY|Create"
+        "POLICY|Delete"
+        "POLICY|Update"
+        "POLICY|View"
+        # --- SCRIPT_CATEGORY ---
+        "SCRIPT_CATEGORY|Create"
+        "SCRIPT_CATEGORY|Delete"
+        "SCRIPT_CATEGORY|Run"
+        "SCRIPT_CATEGORY|Scheduled.Task.Create"
+        "SCRIPT_CATEGORY|Scheduled.Task.Delete"
+        "SCRIPT_CATEGORY|Scheduled.Task.Update"
+        "SCRIPT_CATEGORY|Scheduled.Task.View"
+        "SCRIPT_CATEGORY|Update"
+        "SCRIPT_CATEGORY|View"
+        # --- TICKETING ---
+        "TICKETING|Board.View"
+        "TICKETING|Configuration.Ticketing.Access"
+        "TICKETING|Manage.Tickets.NoOrg.Access"
+        "TICKETING|PendingEmailBoard.Manage"
+        "TICKETING|PendingEmailBoard.View"
+        "TICKETING|Private.Comments.Update.All"
+        "TICKETING|Private.Comments.Update.Own"
+        "TICKETING|Private.Comments.View"
+        "TICKETING|Ticket.Create"
+        "TICKETING|Ticket.Delete"
+        "TICKETING|Ticket.Update"
+        "TICKETING|Ticket.View"
+        "TICKETING|Ticketing.Comment.Change.History.View"
+        "TICKETING|Ticketing.Comments.Update.All"
+        "TICKETING|Ticketing.Comments.Update.Own"
+        "TICKETING|Ticketing.Mobile.Access"
+        "TICKETING|Ticketing.RecentTicketsWidget.Access"
+        "TICKETING|Ticketing.Relationship.Manage"
+        "TICKETING|Ticketing.Relationship.View"
+        "TICKETING|Ticketing.ServiceLevelAgreement.Access"
+        "TICKETING|TimeTracked.Update.All"
+        # --- DOCUMENTATION ---
+        "DOCUMENTATION|Checklist.Management.Create"
+        "DOCUMENTATION|Checklist.Management.Delete"
+        "DOCUMENTATION|Checklist.Management.Update"
+        "DOCUMENTATION|Checklist.Management.View"
+        "DOCUMENTATION|Checklist.Template.Create"
+        "DOCUMENTATION|Checklist.Template.Delete"
+        "DOCUMENTATION|Checklist.Template.Update"
+        "DOCUMENTATION|Checklist.Template.View"
+        "DOCUMENTATION|Configuration.Access"
+        "DOCUMENTATION|Export.Access"
+        "DOCUMENTATION|Global.KB.EndUser.Folder.Share.Access"
+        "DOCUMENTATION|Global.KB.Management.Create"
+        "DOCUMENTATION|Global.KB.Management.Delete"
+        "DOCUMENTATION|Global.KB.Management.Update"
+        "DOCUMENTATION|Global.KB.Management.View"
+        "DOCUMENTATION|KB.Management.Access.Restriction.Access"
+        "DOCUMENTATION|KB.Management.Public.Links.Create"
+        "DOCUMENTATION|KB.Management.Public.Links.Delete"
+        "DOCUMENTATION|KB.Management.Public.Links.Update"
+        "DOCUMENTATION|KB.Management.Public.Links.View"
+        "DOCUMENTATION|Management.Create"
+        "DOCUMENTATION|Management.Delete"
+        "DOCUMENTATION|Management.SecureFields.Access"
+        "DOCUMENTATION|Management.Update"
+        "DOCUMENTATION|Management.View"
+        "DOCUMENTATION|TOTP.Code.Access"
+        "DOCUMENTATION|Template.Create"
+        "DOCUMENTATION|Template.Delete"
+        "DOCUMENTATION|Template.Update"
+        "DOCUMENTATION|Template.View"
+        # --- ITAM ---
+        "ITAM|Itam.AssetRelationship.Create"
+        "ITAM|Itam.AssetRelationship.Delete"
+        "ITAM|Itam.AssetRelationship.Update"
+        "ITAM|Itam.AssetRelationship.View"
+        "ITAM|Itam.CoreAssetAttribute.Update"
+        "ITAM|Itam.CoreAssetAttribute.View"
+        "ITAM|Itam.RelationshipType.Create"
+        "ITAM|Itam.RelationshipType.Delete"
+        "ITAM|Itam.RelationshipType.Update"
+        "ITAM|Itam.RelationshipType.View"
+        "ITAM|Itam.SoftwareLicense.Create"
+        "ITAM|Itam.SoftwareLicense.Delete"
+        "ITAM|Itam.SoftwareLicense.Update"
+        "ITAM|Itam.SoftwareLicense.View"
+        # --- APPROVAL_PROCESS ---
+        "APPROVAL_PROCESS|Approval.Process.Administrative.Actions.Access"
+        "APPROVAL_PROCESS|Approval.Process.Ticketing.Actions.Access"
+        # --- ARTIFICIAL_INTELLIGENCE ---
+        "ARTIFICIAL_INTELLIGENCE|AI.Actions.MCP"
+        "ARTIFICIAL_INTELLIGENCE|AI.MCP.Access"
+        # --- NINJA_PSA ---
+        "NINJA_PSA|Configuration.NinjaPSA.Access"
+        "NINJA_PSA|Configuration.NinjaPSA.OverrideLaborTicketTimeEntry.Access"
+        "NINJA_PSA|Configuration.NinjaPSA.TicketProducts.Create"
+        "NINJA_PSA|Configuration.NinjaPSA.TicketProducts.Delete"
+        "NINJA_PSA|Configuration.NinjaPSA.TicketProducts.Price.Access"
+        "NINJA_PSA|Configuration.NinjaPSA.TicketProducts.Update"
+        "NINJA_PSA|Configuration.NinjaPSA.TicketProducts.View"
+        # --- MDM ---
+        "MDM|Android.Connection.Create"
+        "MDM|Android.Connection.Delete"
+        "MDM|Android.Connection.Update"
+        "MDM|Android.Connection.View"
+        "MDM|AppleADE.Connection.Create"
+        "MDM|AppleADE.Connection.Delete"
+        "MDM|AppleADE.Connection.Update"
+        "MDM|AppleADE.Connection.View"
+        "MDM|AppleAPN.Connection.Create"
+        "MDM|AppleAPN.Connection.Delete"
+        "MDM|AppleAPN.Connection.Update"
+        "MDM|AppleAPN.Connection.View"
+        "MDM|AppleAppsAndBooks.Connection.Create"
+        "MDM|AppleAppsAndBooks.Connection.Delete"
+        "MDM|AppleAppsAndBooks.Connection.Update"
+        "MDM|AppleAppsAndBooks.Connection.View"
+        # --- SYSTEM ---
+        "SYSTEM|ActiveDirectoryDiscovery.Access"
+        "SYSTEM|ActiveDirectoryManagement.Access"
+        "SYSTEM|Backup.Manage"
+        "SYSTEM|Backup.Restore"
+        "SYSTEM|Backup.View"
+        "SYSTEM|BrowserManagement.View"
+        "SYSTEM|Caching.Create"
+        "SYSTEM|Caching.Delete"
+        "SYSTEM|Caching.Update"
+        "SYSTEM|Caching.View"
+        "SYSTEM|Cloudberry.Configure.Access"
+        "SYSTEM|Configuration.Activities.Access"
+        "SYSTEM|Configuration.MicrosoftIntune.Access"
+        "SYSTEM|Configuration.PSA.Access"
+        "SYSTEM|Connectwise.Configure.Access"
+        "SYSTEM|Contact.Create"
+        "SYSTEM|Contact.Delete"
+        "SYSTEM|Contact.Update"
+        "SYSTEM|Contact.View"
+        "SYSTEM|CrowdStrike.Access"
+        "SYSTEM|Custom.Tab.Administration.Create"
+        "SYSTEM|Custom.Tab.Administration.Delete"
+        "SYSTEM|Custom.Tab.Administration.Update"
+        "SYSTEM|Custom.Tab.Administration.View"
+        "SYSTEM|CustomFields.Administration.Create"
+        "SYSTEM|CustomFields.Administration.Delete"
+        "SYSTEM|CustomFields.Administration.Update"
+        "SYSTEM|CustomFields.Administration.View"
+        "SYSTEM|CustomFields.Export.Access"
+        "SYSTEM|CustomSNMP.Update"
+        "SYSTEM|CustomSNMP.View"
+        "SYSTEM|Device.Administration.Access"
+        "SYSTEM|Discovered.Asset.Management.Create"
+        "SYSTEM|Discovered.Asset.Management.Delete"
+        "SYSTEM|Discovered.Asset.Management.Update"
+        "SYSTEM|Discovered.Asset.Management.View"
+        "SYSTEM|EndUserSharing.Access"
+        "SYSTEM|GlobalCustomFieldsManagement.Access"
+        "SYSTEM|GravityZone.Access"
+        "SYSTEM|GravityZone.Scan.Access"
+        "SYSTEM|Itam.Tag.Create"
+        "SYSTEM|Itam.Tag.Delete"
+        "SYSTEM|Itam.Tag.Management.Update"
+        "SYSTEM|Itam.Tag.Management.View"
+        "SYSTEM|Itam.Tag.Update"
+        "SYSTEM|Itam.Tag.View"
+        "SYSTEM|MaintenanceMode.Editor.Access"
+        "SYSTEM|ManagedRole.Administration.Create"
+        "SYSTEM|ManagedRole.Administration.Delete"
+        "SYSTEM|ManagedRole.Administration.Update"
+        "SYSTEM|ManagedRole.Administration.View"
+        "SYSTEM|Manager.Update"
+        "SYSTEM|Manager.UpdateSelfAccess"
+        "SYSTEM|Manager.View"
+        "SYSTEM|MobileApp.Access"
+        "SYSTEM|NinjaConnect.BackgroundMode.Access"
+        "SYSTEM|NinjaConnect.Configure.Access"
+        "SYSTEM|QuickConnect.Configure.Access"
+        "SYSTEM|RelatedItem.Create"
+        "SYSTEM|RelatedItem.Credentials.Access"
+        "SYSTEM|RelatedItem.Delete"
+        "SYSTEM|RelatedItem.Update"
+        "SYSTEM|RelatedItem.View"
+        "SYSTEM|Reports.FullAccess"
+        "SYSTEM|Reports.ViewClaimSchedule"
+        "SYSTEM|Reports.ViewSchedule"
+        "SYSTEM|SaasBackup.EPP.SuperAdmin"
+        "SYSTEM|SaasBackup.EUP.FullAdmin"
+        "SYSTEM|SaasBackup.NPP.SuperAdmin"
+        "SYSTEM|SaasBackup.Ninja.Allow"
+        "SYSTEM|SentinelOne.Access"
+        "SYSTEM|SiemExporter.Access"
+        "SYSTEM|Splashtop.Configure.Access"
+        "SYSTEM|UninstallPatch.Access"
+        "SYSTEM|UninstallSoftware.Access"
+        "SYSTEM|UnmanagedRole.Administration.Create"
+        "SYSTEM|UnmanagedRole.Administration.Delete"
+        "SYSTEM|UnmanagedRole.Administration.Update"
+        "SYSTEM|UnmanagedRole.Administration.View"
+        "SYSTEM|Vulnerability.View"
     )
 }
 
