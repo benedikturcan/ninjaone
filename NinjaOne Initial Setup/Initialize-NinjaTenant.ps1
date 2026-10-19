@@ -50,8 +50,11 @@
               conditions), prefix "Hardening - ". Its 'common' set lands on both the Windows
               Workstation (0.0) and Windows Server (1.0) defaults; the 'serverOnly' set is added to
               the Windows Server default as well.
-            - "dex" - a Digital Employee Experience set (performance / stability Windows Event Log
-              conditions), prefix "DEX - ", applied to the Windows Workstation (0.0) default only.
+            - "dex" - a Digital Employee Experience set, prefix "DEX - ", applied to the Windows
+              Workstation (0.0) default only. Stage 1 is event-only (slow boot / app / driver /
+              service startup, slow shutdown, application & system crashes); Stage 2 adds
+              performance / health "metric" conditions (high CPU & memory, low disk free space,
+              long uptime, degraded SMART status, worn-out battery).
           Each targeted default policy is loaded whole (GET returns { resultCode, policy }), missing
           conditions are merged into content.conditions (keyed by a fresh UUID, deduped by display
           name), the read-only parentPolicyName field is dropped, and the full policy is saved back.
@@ -91,8 +94,9 @@
     Optional. One or more monitoring modules to apply to the default (parent) policies (Pass 5).
     Supported values (comma-separated): hardening (a curated security-monitoring condition set,
     prefixed "Hardening - ", applied to the Workstation and Server defaults) and dex (a Digital
-    Employee Experience performance/stability set, prefixed "DEX - ", applied to the Workstation
-    default only). e.g. -Modules hardening,dex. A modules-only run loads the policies but does not
+    Employee Experience set, prefixed "DEX - ", applied to the Workstation default only; event-based
+    stage 1 plus performance / health metric conditions in stage 2). e.g. -Modules hardening,dex.
+    A modules-only run loads the policies but does not
     rename them or create node roles / child policies / technician roles.
 
 .PARAMETER SessionKey
@@ -983,13 +987,17 @@ function Invoke-NinjaApi {
 }
 
 # Build one fully-formed monitoring condition in the shape NinjaOne persists inside
-# policy.content.conditions (keyed by a UUID). Two condition types are supported:
-#   - "event"   : a Windows Event Log condition  (conditionUid = event GUID)
+# policy.content.conditions (keyed by a UUID). Three condition types are supported:
+#   - "event"   : a Windows Event Log condition    (conditionUid = event GUID)
 #   - "service" : a Windows Service state condition (conditionUid = service GUID)
+#   - "metric"  : a performance / health condition (CPU, Memory, Disk Free Space,
+#                 System Uptime, SMART, Battery, ...). Every metric type has its own
+#                 conditionUid and its own parameters shape, so the caller supplies a
+#                 pre-built -Parameters hashtable (and -ConditionName) verbatim.
 # The type is carried by conditionUid; parameters define the specific condition.
 function Build-ModuleCondition {
     param(
-        [Parameter(Mandatory)] [ValidateSet("event", "service")] [string] $Type,
+        [Parameter(Mandatory)] [ValidateSet("event", "service", "metric")] [string] $Type,
         [Parameter(Mandatory)] [string] $DisplayName,
         [string[]] $EventIds,
         [string[]] $Include,
@@ -997,7 +1005,14 @@ function Build-ModuleCondition {
         [int] $ResetThreshold = 14400,
         [string] $ConditionHealthStatus = "NEEDS_ATTENTION",
         [int] $AlertingDelayMinutes = 3,
-        [Parameter(Mandatory)] [string] $ConditionUid
+        [Parameter(Mandatory)] [string] $ConditionUid,
+        # "metric" only: the exact conditionName and parameters NinjaOne persists for
+        # this condition type, plus an optional top-level trigger-uptime delay (seconds).
+        # IDictionary accepts both Hashtable and the OrderedHashtable that
+        # ConvertFrom-Json -AsHashtable produces, without a lossy re-coercion.
+        [string] $ConditionName,
+        [System.Collections.IDictionary] $Parameters,
+        [int] $TriggerUptimeSeconds = 0
     )
 
     $cond = [ordered]@{
@@ -1034,6 +1049,16 @@ function Build-ModuleCondition {
             contain    = "do"
             include    = "all"
         }
+    }
+    elseif ($Type -eq "metric") {
+        # Performance / health condition: the caller hands over the verbatim
+        # conditionName and parameters captured from NinjaOne, so the builder only
+        # wraps the shared envelope. Disk Free Space carries a top-level trigger delay.
+        $cond.conditionName           = $ConditionName
+        $cond.parameters              = $Parameters
+        $cond.resetIfNotPresentSeconds = 0
+        $cond.notifyOnReset            = $false
+        if ($TriggerUptimeSeconds -gt 0) { $cond.triggerUptimeSeconds = $TriggerUptimeSeconds }
     }
     else {
         $joined = ($Include -join " OR ")
@@ -1351,11 +1376,15 @@ if ($hasModuleSelection) {
 }
 '@
 
-    # Curated DEX (Digital Employee Experience) condition set — workstation-only,
-    # "stage 1" is event-only: slow boot / app / driver / service startup, slow
-    # shutdown, and application/system crashes that degrade day-to-day usability.
-    # Each event carries its own log 'source' (they span several providers), which
-    # overrides the module-level eventSource (null here).
+    # Curated DEX (Digital Employee Experience) condition set — workstation-only.
+    #   Stage 1 ("workstation") is event-only: slow boot / app / driver / service
+    #     startup, slow shutdown, and application/system crashes that degrade day-to-
+    #     day usability. Each event carries its own log 'source' (they span several
+    #     providers), overriding the module-level eventSource (null here).
+    #   Stage 2 ("workstationStage2") adds performance / health "metric" conditions:
+    #     high CPU / memory, low disk free space, long uptime (no reboot), degraded
+    #     SMART status and worn-out battery. Each metric type has its own conditionUid
+    #     and a verbatim parameters block captured from NinjaOne.
     $dexJson = @'
 {
   "prefix": "💻 DEX - ",
@@ -1380,6 +1409,47 @@ if ($hasModuleSelection) {
       { "name": "Unexpected Power Loss or System Crash", "source": "Microsoft-Windows-Kernel-Power", "eventIds": ["41"] },
       { "name": "Blue Screen Crash (Bugcheck)", "source": "BugCheck", "eventIds": ["1001"] }
     ]
+  },
+  "workstationStage2": {
+    "metrics": [
+      {
+        "name": "High CPU Usage",
+        "conditionUid": "61147e9c-c5bd-4f3a-ac98-b5ecfc9ab579",
+        "conditionName": "Aggregate CPU Usage is greater than or equal to 90 % for 5 minutes",
+        "parameters": { "duration": 5, "operator": "GE", "threshold": 90, "unit": "PERCENT" }
+      },
+      {
+        "name": "High Memory Usage",
+        "conditionUid": "223bbcc1-83d4-48a0-8ae5-546573b61fea",
+        "conditionName": "Memory Usage is greater than or equal to 90 % for 5 minutes",
+        "parameters": { "duration": 5, "operator": "GE", "threshold": 90, "unit": "PERCENT" }
+      },
+      {
+        "name": "Long Uptime (No Reboot)",
+        "conditionUid": "7f19f7b2-b2ff-42fb-8a8a-7e0c1fb67ff1",
+        "conditionName": "Device has not rebooted in 14 day(s)",
+        "parameters": { "threshold": 14 }
+      },
+      {
+        "name": "Low Disk Free Space",
+        "conditionUid": "1045af6c-c6b8-4049-bbf4-5a92e422ca6d",
+        "conditionName": "Disk Free Space is less than or equal to 10% for 30 minutes, start alerting after 10 minutes",
+        "parameters": { "duration": 30, "operator": "LE", "threshold": 10, "unit": "PERCENT", "bootVolumeOnly": false, "volumeLabelsMode": "EXCLUDE", "exclude": ["RECOVERY_VOLUME", "REMOVABLE_DISK"], "include": [] },
+        "triggerUptimeSeconds": 600
+      },
+      {
+        "name": "Disk SMART Status Degraded",
+        "conditionUid": "0ffc1334-2ced-45f5-bec2-4ddba88a5ff6",
+        "conditionName": "Windows SMART Status Degraded",
+        "parameters": { "checkPredFail": false }
+      },
+      {
+        "name": "Degraded Battery Health",
+        "conditionUid": "6a626396-d869-43d9-b813-e21422f6bbea",
+        "conditionName": "Battery Monitoring: Battery Capacity is less than 50%",
+        "parameters": { "appliedCondition": "BATTERY_CAPACITY", "operator": "LT", "threshold": 50, "unit": "PERCENT" }
+      }
+    ]
   }
 }
 '@
@@ -1398,7 +1468,7 @@ if ($hasModuleSelection) {
             Key     = "dex"
             Title   = "DEX (Digital Employee Experience) monitoring conditions"
             Json    = $dexJson
-            Targets = [ordered]@{ WINDOWS_WORKSTATION = @("workstation") }
+            Targets = [ordered]@{ WINDOWS_WORKSTATION = @("workstation", "workstationStage2") }
         }
     )
 
@@ -1431,12 +1501,20 @@ if ($hasModuleSelection) {
                 continue
             }
 
-            # Collect the condition definitions that apply to this nodeClass.
+            # Collect the condition definitions that apply to this nodeClass. Buckets only
+            # carry the kinds they need (e.g. DEX stage 1 has events only, stage 2 metrics
+            # only), so read each kind with index access: ConvertFrom-Json -AsHashtable
+            # yields an OrderedHashtable whose missing-key DOT access throws under
+            # Set-StrictMode, whereas ['key'] safely returns $null.
             $eventDefs   = [System.Collections.Generic.List[object]]::new()
             $serviceDefs = [System.Collections.Generic.List[object]]::new()
+            $metricDefs  = [System.Collections.Generic.List[object]]::new()
             foreach ($bucket in $moduleTargets[$nodeClass]) {
-                if ($def[$bucket].events)   { foreach ($e in $def[$bucket].events)   { $eventDefs.Add($e) } }
-                if ($def[$bucket].services) { foreach ($s in $def[$bucket].services) { $serviceDefs.Add($s) } }
+                $b = $def[$bucket]
+                if (-not $b) { continue }
+                if ($b['events'])   { foreach ($e in $b['events'])   { $eventDefs.Add($e) } }
+                if ($b['services']) { foreach ($s in $b['services']) { $serviceDefs.Add($s) } }
+                if ($b['metrics'])  { foreach ($m in $b['metrics'])  { $metricDefs.Add($m) } }
             }
 
             # Load the full policy object (GET returns { resultCode, policy }).
@@ -1471,7 +1549,9 @@ if ($hasModuleSelection) {
                 $displayName = $prefix + [string]$e.name
                 if ($existingNames.Contains($displayName)) { $skippedThisPolicy++; continue }
                 # Per-event source wins over the module default (DEX events span providers).
-                $evSource = if ($e.source) { [string]$e.source } else { $defaultSource }
+                # Index access: hardening events carry no 'source' key, and a missing-key
+                # DOT access on the OrderedHashtable would throw under Set-StrictMode.
+                $evSource = if ($e['source']) { [string]$e['source'] } else { $defaultSource }
                 $cond = Build-ModuleCondition -Type "event" -DisplayName $displayName `
                     -EventIds @($e.eventIds) -EventSource $evSource `
                     -ResetThreshold $resetThresh -ConditionHealthStatus $healthStatus `
@@ -1488,6 +1568,23 @@ if ($hasModuleSelection) {
                     -Include @($s.include) `
                     -ResetThreshold $resetThresh -ConditionHealthStatus $healthStatus `
                     -AlertingDelayMinutes $alertMinutes -ConditionUid $serviceUid
+                $conditions[[guid]::NewGuid().ToString()] = $cond
+                [void]$existingNames.Add($displayName)
+                $addedThisPolicy++
+            }
+
+            foreach ($m in $metricDefs) {
+                $displayName = $prefix + [string]$m['name']
+                if ($existingNames.Contains($displayName)) { $skippedThisPolicy++; continue }
+                # Each metric type carries its own conditionUid and a verbatim parameters
+                # block; only Disk Free Space carries a top-level triggerUptimeSeconds, so
+                # read it with index access (missing-key DOT access throws under StrictMode).
+                $trig = if ($m['triggerUptimeSeconds']) { [int]$m['triggerUptimeSeconds'] } else { 0 }
+                $cond = Build-ModuleCondition -Type "metric" -DisplayName $displayName `
+                    -ConditionName ([string]$m['conditionName']) -Parameters $m['parameters'] `
+                    -TriggerUptimeSeconds $trig `
+                    -ResetThreshold $resetThresh -ConditionHealthStatus $healthStatus `
+                    -ConditionUid ([string]$m['conditionUid'])
                 $conditions[[guid]::NewGuid().ToString()] = $cond
                 [void]$existingNames.Add($displayName)
                 $addedThisPolicy++
