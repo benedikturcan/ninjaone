@@ -60,6 +60,16 @@
           name), the read-only parentPolicyName field is dropped, and the full policy is saved back.
           GET /swb/s6/policy/{id}  ->  PUT /swb/s6/policy/{id}  (full unwrapped policy object)
 
+      Pass 6 - DEX Survey device custom fields (only when -Modules includes "dex")
+          Provisions the DEVICE (NODE) custom fields the "DEX Survey" automation writes to, named
+          exactly as those scripts prescribe so the field names line up with the scripts' parameter
+          defaults: latestUserFeedback (Multi-line) and userFeedbackHistory (WYSIWYG). Each is created
+          with its Automations permission set to Read/Write (scriptPermission = READ_WRITE) so the
+          SYSTEM-run DEX scripts can write it - the UI default (None) would silently block the write.
+          Device custom fields are tenant-wide, so this pass is independent of the policy the dex
+          module targets. Idempotent: an existing field (matched by fieldName) is skipped.
+          GET /swb/s6/attributes/node/definitionScope/NODE  ->  POST /swb/s6/attributes/node
+
     A child policy links to its parent ONLY via parentPolicyId and inherits the parent's settings;
     it is not tied to the custom node role, so the policy passes do not depend on the role pass. This
     is why -Roles and -Policies are independent: pass the same keys to both to get node roles AND
@@ -96,7 +106,9 @@
     prefixed "Hardening - ", applied to the Workstation and Server defaults) and dex (a Digital
     Employee Experience set, prefixed "DEX - ", applied to the Workstation default only; event-based
     stage 1 plus performance / health metric conditions in stage 2). e.g. -Modules hardening,dex.
-    A modules-only run loads the policies but does not
+    Selecting "dex" also provisions the DEX Survey device custom fields (Pass 6): latestUserFeedback
+    (Multi-line) and userFeedbackHistory (WYSIWYG), each with Automations = Read/Write so the
+    SYSTEM-run DEX Survey scripts can write them. A modules-only run loads the policies but does not
     rename them or create node roles / child policies / technician roles.
 
 .PARAMETER SessionKey
@@ -935,6 +947,8 @@ $noderoleListUri   = "$baseUrl/swb/s6/noderole/list?allRoles=true"
 $policyUri         = "$baseUrl/swb/s6/policy"
 $policyListUri     = "$baseUrl/swb/s6/policy/list"
 $userRolesEndpoint = "$baseUrl/swb/s6/user-roles"
+$attributesNodeUri     = "$baseUrl/swb/s6/attributes/node"                       # POST create a device (NODE) custom field
+$attributesNodeListUri = "$baseUrl/swb/s6/attributes/node/definitionScope/NODE"  # GET list device custom fields
 $userAgent       = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
 
 # .NET HttpClient with AllowAutoRedirect=$false: the create POSTs answer with a redirect to an
@@ -1106,12 +1120,14 @@ $failed       = 0
 $techCreated  = 0
 $techUpdated  = 0
 $modulesApplied = 0
+$customFieldsCreated = 0
 $rolesCreatedNames = [System.Collections.Generic.List[string]]::new()  # created node roles
 $renamedNames      = [System.Collections.Generic.List[string]]::new()  # renamed default policies
 $createdNames      = [System.Collections.Generic.List[string]]::new()  # created child policies
 $techCreatedNames  = [System.Collections.Generic.List[string]]::new()  # created technician roles
 $techUpdatedNames  = [System.Collections.Generic.List[string]]::new()  # updated technician roles
 $moduleNames       = [System.Collections.Generic.List[string]]::new()  # "<module> -> <policy> (+N)" for applied conditions
+$customFieldNames  = [System.Collections.Generic.List[string]]::new()  # "<fieldName> (<type>)" for created device custom fields
 
 # =============================================================================
 # Pass 1: create custom node roles (only when -Roles is given)
@@ -1622,6 +1638,101 @@ if ($hasModuleSelection) {
 }
 
 # =============================================================================
+# Pass 6: DEX Survey device custom fields (only when -Modules includes "dex")
+# =============================================================================
+# The "DEX Survey" automation from the NinjaOne script template library ("Request
+# User Feedback", "Collect User Feedback", "System Performance Check") persists its
+# results into DEVICE (NODE) custom fields via Ninja-Property-Set. Those scripts run
+# under the SYSTEM account, and a SYSTEM/automation write only succeeds if the field's
+# Automations permission is Read/Write (scriptPermission = READ_WRITE); the UI default
+# is None, which silently blocks the write. This pass provisions the two fields the DEX
+# Survey scripts prescribe BY NAME, so the field names line up with the scripts' own
+# parameter defaults and no manual wiring is needed:
+#   - latestUserFeedback  (Multi-line) <- "Collect User Feedback" $MultilineCustomFieldName
+#   - userFeedbackHistory (WYSIWYG)    <- "Collect User Feedback" $WYSIWYGCustomFieldName
+# ("System Performance Check" also writes a WYSIWYG field, but its script variable has
+# no prescribed default name - the admin points it at a field at run time - so we do not
+# invent one here.) Device custom fields are tenant-wide (not policy-scoped), so this pass
+# is independent of which default policy the dex module (Pass 5) targets. Idempotent:
+# an existing field (matched by fieldName, case-insensitive) is skipped.
+#   GET  /swb/s6/attributes/node/definitionScope/NODE   (existing fields - idempotency)
+#   POST /swb/s6/attributes/node                          (create one missing field)
+if ($hasModuleSelection -and ($cleanModules -contains "dex")) {
+    Write-Host "== DEX Survey device custom fields =="
+
+    # The two fields the DEX Survey scripts write to, named exactly as the scripts expect.
+    # attributeType drives the field type; advancedSettings is WYSIWYG-only (null otherwise).
+    $dexCustomFields = @(
+        [ordered]@{ fieldName = "latestUserFeedback";  label = "Latest User Feedback";  attributeType = "TEXT_MULTILINE"; advancedSettings = $null }
+        [ordered]@{ fieldName = "userFeedbackHistory"; label = "User Feedback History"; attributeType = "WYSIWYG";        advancedSettings = [ordered]@{ expandLargeValueOnRender = $false } }
+    )
+
+    # Existing NODE custom fields -> case-insensitive set of field names for idempotency.
+    $existingFieldNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $cfListResp = Invoke-NinjaApi -Method "GET" -Uri $attributesNodeListUri
+    if ($cfListResp.Code -ge 400) {
+        Write-Host ("[ERROR {0}] could not list device custom fields - {1}" -f $cfListResp.Code, $cfListResp.Body) -ForegroundColor Red
+        $failed++
+    }
+    else {
+        $cfList = $cfListResp.Body | ConvertFrom-Json
+        foreach ($f in @($cfList)) {
+            if ($f.PSObject.Properties['fieldName'] -and $f.fieldName) { [void]$existingFieldNames.Add([string]$f.fieldName) }
+        }
+
+        foreach ($spec in $dexCustomFields) {
+            if ($existingFieldNames.Contains($spec['fieldName'])) {
+                Write-Host ("[skip] device custom field '{0}' already exists" -f $spec['fieldName']) -ForegroundColor DarkGray
+                continue
+            }
+
+            # Create body captured verbatim from the web UI's POST, with Automations =
+            # Read/Write (scriptPermission) so the SYSTEM-run DEX Survey scripts can write it.
+            $content = [ordered]@{
+                values           = @()
+                required         = $false
+                footerText       = ""
+                tooltipText      = ""
+                advancedSettings = $spec['advancedSettings']
+            }
+            $createBody = [ordered]@{
+                addToDefaultTab       = $true
+                name                  = $spec['label']
+                fieldName             = $spec['fieldName']
+                attributeType         = $spec['attributeType']
+                description           = ""
+                defaultValue          = $null
+                technicianOption      = "OPTIONAL"
+                scriptPermission      = "READ_WRITE"   # Automations: Read/Write (lets SYSTEM scripts write)
+                apiPermission         = "NONE"
+                technicianPermission  = "EDITABLE"
+                technicianPermissions = @()
+                definitionScope       = @("NODE")
+                content               = $content
+                attributeScope        = "NODE_ROLE"
+            } | ConvertTo-Json -Depth 8
+
+            if ($PSCmdlet.ShouldProcess($spec['fieldName'], "POST create device custom field ($($spec['attributeType']))")) {
+                $r = Invoke-NinjaApi -Method "POST" -Uri $attributesNodeUri -Body $createBody
+                if ($r.Code -lt 400) {
+                    Write-Host ("[OK {0}] created device custom field '{1}' ({2})" -f $r.Code, $spec['fieldName'], $spec['attributeType']) -ForegroundColor Green
+                    $customFieldsCreated++
+                    $customFieldNames.Add(("{0} ({1})" -f $spec['fieldName'], $spec['attributeType']))
+                }
+                else {
+                    Write-Host ("[ERROR {0}] '{1}' - {2}" -f $r.Code, $spec['fieldName'], $r.Body) -ForegroundColor Red
+                    $failed++
+                }
+            }
+            else {
+                Write-Host ("[WhatIf] POST create device custom field '{0}' ({1})" -f $spec['fieldName'], $spec['attributeType'])
+            }
+        }
+    }
+    Write-Host ""
+}
+
+# =============================================================================
 # Pass 4: technician roles (only when -TechnicianRoles is given)
 # =============================================================================
 # Create-or-update one technician role per selected profile. A full-replace PUT carries the whole
@@ -1798,11 +1909,16 @@ if ($moduleNames.Count -gt 0) {
     Write-Host ("Module conditions applied to default policies ({0}):" -f $moduleNames.Count)
     foreach ($n in $moduleNames) { Write-Host ("  - {0}" -f $n) }
 }
+if ($customFieldNames.Count -gt 0) {
+    Write-Host ("Created device custom fields ({0}):" -f $customFieldNames.Count)
+    foreach ($n in $customFieldNames) { Write-Host ("  - {0}" -f $n) }
+}
 if ($rolesCreatedNames.Count -eq 0 -and $renamedNames.Count -eq 0 -and $createdNames.Count -eq 0 -and `
-    $techCreatedNames.Count -eq 0 -and $techUpdatedNames.Count -eq 0 -and $moduleNames.Count -eq 0) {
+    $techCreatedNames.Count -eq 0 -and $techUpdatedNames.Count -eq 0 -and $moduleNames.Count -eq 0 -and `
+    $customFieldNames.Count -eq 0) {
     Write-Host "Nothing changed - everything already matched the desired state."
 }
 Write-Host ""
-Write-Host ("Done. Node roles: {0}, Renamed: {1}, Child policies: {2}, Tech roles: +{3}/~{4}, Modules: +{5}, Skipped: {6}, Failed: {7}" -f `
-    $rolesCreated, $renamed, $created, $techCreated, $techUpdated, $modulesApplied, $skipped, $failed)
+Write-Host ("Done. Node roles: {0}, Renamed: {1}, Child policies: {2}, Tech roles: +{3}/~{4}, Modules: +{5}, Custom fields: +{6}, Skipped: {7}, Failed: {8}" -f `
+    $rolesCreated, $renamed, $created, $techCreated, $techUpdated, $modulesApplied, $customFieldsCreated, $skipped, $failed)
 if ($failed -gt 0) { exit 1 }
