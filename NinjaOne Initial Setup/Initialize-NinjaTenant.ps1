@@ -1,29 +1,32 @@
 <#
 .SYNOPSIS
     One-shot NinjaOne tenant initial setup: creates the custom node roles, the matching policy
-    hierarchy (default-policy naming convention + child policies) AND the technician permission
-    roles (1st/2nd/3rd Level Support + Sys Admin) in a single run.
+    hierarchy (default-policy naming convention + child policies), the technician permission
+    roles (1st/2nd/3rd Level Support + Sys Admin) AND applies monitoring modules (e.g. the
+    "hardening" security-monitoring condition set) to the default policies in a single run.
 
 .DESCRIPTION
     Talks to the internal /swb/s6/* endpoints the web UI uses, authenticated with a short-lived
-    browser session cookie (sessionKey). -Roles drives the device/policy side, -TechnicianRoles the
-    technician-permission side; either is optional. The script runs in four passes:
+    browser session cookie (sessionKey). -Roles drives the node-role side, -Policies the policy
+    hierarchy, -TechnicianRoles the technician-permission side and -Modules the monitoring modules;
+    each is optional and independent, so selecting a role no longer forces its policy to be created.
+    The script runs in five passes:
 
       Pass 1 - Node roles (only when -Roles is given)
           Creates one custom node role per selected role.
           POST /swb/s6/noderole
 
-      Pass 2 - Default policy naming convention (when -Roles is given, or on a bare call)
+      Pass 2 - Default policy naming convention (when -Policies is given, or on a bare call)
           Renames every built-in default policy to the numbering convention so the whole
-          hierarchy stays consistent even for categories without roles:
+          hierarchy stays consistent even for categories without child policies:
               Windows Workstation Policy  ->  0.0 Windows Workstation Policy
               Windows Server Policy       ->  1.0 Windows Server Policy
               Mac / Mac Server / Linux / Linux Server -> 2.0 / 3.0 / 4.0 / 5.0 ...
           PATCH /swb/s6/policy/{id}  { name, description, enabled }
-          (Skipped on a technician-roles-only run, so a -TechnicianRoles call never touches policies.)
+          (Skipped on a roles-only or technician-roles-only run, so neither touches the policies.)
 
-      Pass 3 - Child policies (only when -Roles is given)
-          Creates one child policy per selected role, inheriting everything from that role's
+      Pass 3 - Child policies (only when -Policies is given)
+          Creates one child policy per selected policy, inheriting everything from that category's
           default (its parent). Numbering "{major}.{minor}", e.g.:
               1.1 Windows Server Policy - Terminal Server
               1.2 Windows Server Policy - SQL Server    ...
@@ -39,27 +42,54 @@
           desired grants. Four built-in profiles form a strict escalation L1 <= L2 <= L3 <= Sys Admin.
           GET/POST/PUT /swb/s6/user-roles
 
+      Pass 5 - Monitoring modules (only when -Modules is given)
+          Applies a curated set of monitoring conditions to the DEFAULT (parent) policies so every
+          child policy inherits them. The only module today is "hardening" - a security-monitoring
+          condition set (Windows Event Log + Windows Service conditions) embedded directly in this
+          script, so no companion data file is needed. Every condition's display name is prefixed
+          "Hardening - ". The
+          'common' set lands on both the Windows Workstation (0.0) and Windows Server (1.0) defaults;
+          the 'serverOnly' set is added to the Windows Server default as well. Each default policy is
+          loaded whole (GET returns { resultCode, policy }), missing conditions are merged into
+          content.conditions (keyed by a fresh UUID, deduped by display name), the read-only
+          parentPolicyName field is dropped, and the full policy is saved back.
+          GET /swb/s6/policy/{id}  ->  PUT /swb/s6/policy/{id}  (full unwrapped policy object)
+
     A child policy links to its parent ONLY via parentPolicyId and inherits the parent's settings;
-    it is not tied to the custom node role, so the policy passes do not depend on the role pass.
+    it is not tied to the custom node role, so the policy passes do not depend on the role pass. This
+    is why -Roles and -Policies are independent: pass the same keys to both to get node roles AND
+    their policies, or just one of them to get only that side.
 
     Fully idempotent and -WhatIf-safe: existing node roles are skipped, defaults already carrying
-    the convention name are left alone, an already-existing child is skipped, and a technician role
-    already carrying exactly its profile is skipped. Safe to re-run.
+    the convention name are left alone, an already-existing child is skipped, a technician role
+    already carrying exactly its profile is skipped, and a hardening condition already present on a
+    default policy (matched by display name) is not re-added. Safe to re-run.
 
     The sessionKey is a short-lived session cookie from a logged-in browser session. Once it
     expires you get 401/403 back - sign in again in the browser and pass the current value.
 
 .PARAMETER Roles
-    Optional. One or more device roles to create (node role + child policy). Group keywords
-    (server-all, workstation-all, testlab) and/or individual short keys (comma-separated),
-    e.g. -Roles server-all,testworkstation. Omit entirely to only enforce the default-policy
-    naming convention (Pass 2) without creating any roles or child policies.
+    Optional. One or more device roles to create as custom node roles (Pass 1 only - no policies).
+    Group keywords (server-all, workstation-all, testlab) and/or individual short keys
+    (comma-separated), e.g. -Roles server-all,testworkstation.
+
+.PARAMETER Policies
+    Optional. One or more device roles to create as child policies (Pass 3), independent of -Roles.
+    Same keyword/short-key grammar as -Roles, e.g. -Policies server-all,testworkstation. Giving
+    -Policies also enforces the default-policy naming convention (Pass 2). Omit -Roles, -Policies and
+    -TechnicianRoles entirely to only enforce the naming convention without creating anything.
 
 .PARAMETER TechnicianRoles
     Optional. One or more technician permission profiles to create-or-update (Pass 4). Profile keys
     (comma-separated): 1st-level-support, 2nd-level-support, 3rd-level-support, system-administrator;
     or the group keyword tech-all. Each profile maps to a fixed role name (e.g. system-administrator
     -> "Sys Admin"). A technician-roles-only run does not touch the policy hierarchy.
+
+.PARAMETER Modules
+    Optional. One or more monitoring modules to apply to the default (parent) policies (Pass 5).
+    Supported value: hardening (a curated security-monitoring condition set, prefixed "Hardening - ").
+    e.g. -Modules hardening. A modules-only run loads the policies but does not rename them or create
+    node roles / child policies / technician roles.
 
 .PARAMETER SessionKey
     The sessionKey cookie value from the logged-in NinjaOne browser session.
@@ -75,12 +105,20 @@
 .EXAMPLE
     $env:NINJA_SESSION_KEY = "<sessionKey-from-browser>"
     .\Initialize-NinjaTenant.ps1 -Roles server-all
-    Creates the five Windows Server node roles, renames every default policy to the convention,
-    and creates one child policy per server role (1.1 .. 1.5).
+    Creates the five Windows Server node roles only - no policies are touched.
+
+.EXAMPLE
+    .\Initialize-NinjaTenant.ps1 -Policies server-all
+    Renames every default policy to the convention and creates one child policy per server role
+    (1.1 .. 1.5) - without creating any node role.
+
+.EXAMPLE
+    .\Initialize-NinjaTenant.ps1 -Roles server-all -Policies server-all
+    Full server setup: the five node roles AND their five child policies (plus the naming convention).
 
 .EXAMPLE
     .\Initialize-NinjaTenant.ps1
-    No roles: only renames every built-in default policy to the convention (0.0, 1.0, 2.0, ...).
+    No selection: only renames every built-in default policy to the convention (0.0, 1.0, 2.0, ...).
 
 .EXAMPLE
     .\Initialize-NinjaTenant.ps1 -TechnicianRoles tech-all
@@ -92,20 +130,34 @@
     Creates (or updates) the full-access "Sys Admin" technician role (all 208 grants).
 
 .EXAMPLE
-    .\Initialize-NinjaTenant.ps1 -Roles server-all -TechnicianRoles tech-all -WhatIf
-    Dry run of the full tenant setup: node roles, policy renames, child policies and all four
-    technician roles - sends nothing.
+    .\Initialize-NinjaTenant.ps1 -Modules hardening
+    Applies the curated "hardening" monitoring conditions to the Windows Workstation and Windows
+    Server default policies (so every child policy inherits them) - nothing else is touched.
+
+.EXAMPLE
+    .\Initialize-NinjaTenant.ps1 -Roles server-all -Policies server-all -TechnicianRoles tech-all -Modules hardening -WhatIf
+    Dry run of the full tenant setup: node roles, policy renames, child policies, all four
+    technician roles and the hardening monitoring module - sends nothing.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    # Optional: if omitted (and no -TechnicianRoles), only the default-policy naming convention runs.
+    # Optional: device roles to create as custom node roles (Pass 1). Does NOT create any policies.
     [Parameter(Position = 0)]
     [string[]] $Roles = @(),
+
+    # Optional: device roles to create as child policies (Pass 3). Independent of -Roles.
+    [Parameter()]
+    [string[]] $Policies = @(),
 
     # Optional: technician permission profiles to create-or-update (Pass 4).
     [Parameter()]
     [string[]] $TechnicianRoles = @(),
+
+    # Optional: monitoring modules to apply to the default (parent) policies (Pass 5).
+    # Currently supported: "hardening" (a curated set of security monitoring conditions).
+    [Parameter()]
+    [string[]] $Modules = @(),
 
     [Parameter()]
     [string] $SessionKey = $env:NINJA_SESSION_KEY,
@@ -833,18 +885,33 @@ function Resolve-NinjaTechnicianSelection {
     return $selected
 }
 
-# --- Resolve selections (both optional) ---------------------------------------
-$cleanRoles   = @($Roles | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-$hasSelection = $cleanRoles.Count -gt 0
-$selected     = if ($hasSelection) { Resolve-NinjaRoleSelection -Roles $cleanRoles } else { $null }
+# --- Resolve selections (all optional) ----------------------------------------
+# -Roles drives node roles only (Pass 1); -Policies drives the policy hierarchy (Pass 3). They are
+# independent, so selecting a role no longer forces its policy to be created.
+$cleanRoles       = @($Roles | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+$hasRoleSelection = $cleanRoles.Count -gt 0
+$selectedRoles    = if ($hasRoleSelection) { Resolve-NinjaRoleSelection -Roles $cleanRoles } else { $null }
+
+$cleanPolicies      = @($Policies | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+$hasPolicySelection = $cleanPolicies.Count -gt 0
+$selectedPolicies   = if ($hasPolicySelection) { Resolve-NinjaRoleSelection -Roles $cleanPolicies } else { $null }
 
 $cleanTech        = @($TechnicianRoles | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 $hasTechSelection = $cleanTech.Count -gt 0
 $selectedTech     = if ($hasTechSelection) { Resolve-NinjaTechnicianSelection -Keys $cleanTech } else { $null }
 
-# The naming convention runs with -Roles, or on a bare call (no selection at all), but is skipped on
-# a technician-roles-only run so a -TechnicianRoles call never renames policies.
-$runNaming = $hasSelection -or (-not $hasTechSelection)
+# -Modules drives monitoring modules applied to the default (parent) policies (Pass 5).
+$SupportedModules  = @("hardening")
+$cleanModules      = @($Modules | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.ToLowerInvariant() } | Select-Object -Unique)
+$unknownModules    = @($cleanModules | Where-Object { $SupportedModules -notcontains $_ })
+if ($unknownModules.Count -gt 0) {
+    throw ("Unknown -Modules value(s): {0}. Supported: {1}." -f ($unknownModules -join ", "), ($SupportedModules -join ", "))
+}
+$hasModuleSelection = $cleanModules.Count -gt 0
+
+# The naming convention runs with -Policies, or on a bare call (no selection at all). It is skipped on
+# a roles-only or technician-roles-only run so neither touches the policy hierarchy.
+$runNaming = $hasPolicySelection -or (-not $hasRoleSelection -and -not $hasTechSelection -and -not $hasModuleSelection)
 
 # =============================================================================
 # HTTP client
@@ -906,15 +973,93 @@ function Invoke-NinjaApi {
     }
 }
 
+# Build one fully-formed monitoring condition in the shape NinjaOne persists inside
+# policy.content.conditions (keyed by a UUID). Two condition types are supported:
+#   - "event"   : a Windows Event Log condition  (conditionUid = event GUID)
+#   - "service" : a Windows Service state condition (conditionUid = service GUID)
+# The type is carried by conditionUid; parameters define the specific condition.
+function Build-HardeningCondition {
+    param(
+        [Parameter(Mandatory)] [ValidateSet("event", "service")] [string] $Type,
+        [Parameter(Mandatory)] [string] $DisplayName,
+        [string[]] $EventIds,
+        [string[]] $Include,
+        [string] $EventSource,
+        [int] $ResetThreshold = 14400,
+        [string] $ConditionHealthStatus = "NEEDS_ATTENTION",
+        [int] $AlertingDelayMinutes = 3,
+        [Parameter(Mandatory)] [string] $ConditionUid
+    )
+
+    $cond = [ordered]@{
+        enabled               = $true
+        displayName           = $DisplayName
+        conditionName         = $null
+        conditionUid          = $ConditionUid
+        resetThreshold        = $ResetThreshold
+        ticketingAction       = "NONE"
+        notificationAction    = "NONE"
+        parameters            = $null
+        ticketRulesetId       = "NONE"
+        createNinjaTicket     = $false
+        useGlobalHealthStatus = $true
+        conditionHealthStatus = $ConditionHealthStatus
+        scripts               = @()
+        packName              = $null
+        inheritance           = [ordered]@{
+            inherited        = $false
+            dynamic          = $false
+            overridden       = $false
+            sourcePolicyId   = $null
+            sourcePolicyName = ""
+        }
+    }
+
+    if ($Type -eq "event") {
+        $cond.conditionName = 'Event "all" is triggered'
+        $cond.parameters = [ordered]@{
+            state      = "STOPPED"
+            source     = $EventSource
+            eventIds   = @($EventIds)
+            textValues = @()
+            contain    = "do"
+            include    = "all"
+        }
+    }
+    else {
+        $joined = ($Include -join " OR ")
+        $cond.conditionName = ("Windows Service {0} is Down. Start alerting after {1} minutes" -f $joined, $AlertingDelayMinutes)
+        $cond.parameters = [ordered]@{
+            include                                    = @($Include)
+            state                                      = "STOPPED"
+            triggerConditionAgainIfStillTrueAfterReset = $false
+            ignoreIfServiceIsDisabled                  = $false
+            ignoreIfServiceIsManual                    = $false
+            alertingDelay                              = $AlertingDelayMinutes
+            alertingDelayTimeUnit                      = "MINUTE"
+        }
+        $cond.resetIfNotPresentSeconds = 0
+        $cond.notifyOnReset            = $false
+    }
+
+    return $cond
+}
+
 Write-Host "Target: $baseUrl"
-if ($hasSelection) {
-    Write-Host ("Selected roles ({0}): {1}" -f $selected.Count, (($selected.Values | ForEach-Object { $_.name }) -join ", "))
+if ($hasRoleSelection) {
+    Write-Host ("Selected node roles ({0}): {1}" -f $selectedRoles.Count, (($selectedRoles.Values | ForEach-Object { $_.name }) -join ", "))
+}
+if ($hasPolicySelection) {
+    Write-Host ("Selected policies ({0}): {1}" -f $selectedPolicies.Count, (($selectedPolicies.Values | ForEach-Object { $_.name }) -join ", "))
 }
 if ($hasTechSelection) {
     Write-Host ("Selected technician roles ({0}): {1}" -f $selectedTech.Count, (($selectedTech.Values | ForEach-Object { $_.roleName }) -join ", "))
 }
-if (-not $hasSelection -and -not $hasTechSelection) {
-    Write-Host "No roles selected - enforcing the policy naming convention only."
+if ($hasModuleSelection) {
+    Write-Host ("Selected modules ({0}): {1}" -f $cleanModules.Count, ($cleanModules -join ", "))
+}
+if (-not $hasRoleSelection -and -not $hasPolicySelection -and -not $hasTechSelection -and -not $hasModuleSelection) {
+    Write-Host "No selection - enforcing the policy naming convention only."
 }
 Write-Host ""
 
@@ -926,16 +1071,18 @@ $skipped      = 0
 $failed       = 0
 $techCreated  = 0
 $techUpdated  = 0
+$hardeningApplied = 0
 $rolesCreatedNames = [System.Collections.Generic.List[string]]::new()  # created node roles
 $renamedNames      = [System.Collections.Generic.List[string]]::new()  # renamed default policies
 $createdNames      = [System.Collections.Generic.List[string]]::new()  # created child policies
 $techCreatedNames  = [System.Collections.Generic.List[string]]::new()  # created technician roles
 $techUpdatedNames  = [System.Collections.Generic.List[string]]::new()  # updated technician roles
+$hardeningNames    = [System.Collections.Generic.List[string]]::new()  # policies that got hardening conditions
 
 # =============================================================================
 # Pass 1: create custom node roles (only when -Roles is given)
 # =============================================================================
-if ($hasSelection) {
+if ($hasRoleSelection) {
     Write-Host "== Node roles =="
 
     $roleListResp = Invoke-NinjaApi -Method "GET" -Uri $noderoleListUri
@@ -944,7 +1091,7 @@ if ($hasSelection) {
     }
     $existingRoles = @($roleListResp.Body | ConvertFrom-Json)
 
-    foreach ($role in $selected.Values) {
+    foreach ($role in $selectedRoles.Values) {
         $exists = $existingRoles | Where-Object {
             $_.name -eq $role.name -and $_.nodeClass -eq $role.nodeClass
         } | Select-Object -First 1
@@ -986,7 +1133,7 @@ if ($hasSelection) {
 # Load current policies (needed for passes 2 and 3; skipped on a tech-only run)
 # =============================================================================
 $allPolicies = $null
-if ($runNaming -or $hasSelection) {
+if ($runNaming -or $hasPolicySelection -or $hasModuleSelection) {
     $policyListResp = Invoke-NinjaApi -Method "GET" -Uri $policyListUri
     if ($policyListResp.Code -ge 400) {
         throw "Could not load policy list (HTTP $($policyListResp.Code)). Session key expired? Response: $($policyListResp.Body)"
@@ -1044,10 +1191,10 @@ Write-Host ""
 # =============================================================================
 # Pass 3: one child policy per selected role (only when -Roles is given)
 # =============================================================================
-if ($hasSelection) {
-    Write-Host "== Child policies for selected roles =="
+if ($hasPolicySelection) {
+    Write-Host "== Child policies for selected policies =="
     foreach ($nodeClass in $CategoryMeta.Keys) {
-        $rolesInClass = @($selected.Values | Where-Object { $_.nodeClass -eq $nodeClass })
+        $rolesInClass = @($selectedPolicies.Values | Where-Object { $_.nodeClass -eq $nodeClass })
         if ($rolesInClass.Count -eq 0) { continue }
 
         $meta = $CategoryMeta[$nodeClass]
@@ -1113,6 +1260,202 @@ if ($hasSelection) {
             else {
                 Write-Host ("[WhatIf] create '{0}'  (parent {1})" -f $childName, $default.id)
                 $nextMinor++
+            }
+        }
+    }
+    Write-Host ""
+}
+
+# =============================================================================
+# Pass 5: apply monitoring modules to the DEFAULT (parent) policies so every
+#         child policy inherits them (only when -Modules is given).
+#         Currently supported module: "hardening".
+# =============================================================================
+# The curated condition set is embedded directly in this script (see the here-string
+# below), so a single .ps1 is all you need to run - no companion data file.
+# For each target nodeClass we load the full policy object (GET returns
+# { resultCode, policy }), add any missing conditions into content.conditions
+# (keyed by a fresh UUID, deduped by displayName so re-runs are idempotent), drop
+# the read-only parentPolicyName field, then PUT the whole unwrapped policy back.
+if ($hasModuleSelection -and ($cleanModules -contains "hardening")) {
+    Write-Host "== Hardening monitoring conditions (default policies) =="
+
+    # Curated hardening condition set — embedded as a here-string so the script is
+    # fully self-contained (no external hardening-conditions.json file needed). It is
+    # parsed into a hashtable so the rest of Pass 5 below stays exactly the same.
+    # 'common' goes on both the Windows Workstation (0.0) and Windows Server (1.0)
+    # default policies; 'serverOnly' is added to the Windows Server default only.
+    $hardeningJson = @'
+{
+  "prefix": "🛡️ Hardening - ",
+  "eventSource": "Microsoft-Windows-Security-Auditing",
+  "resetThreshold": 14400,
+  "conditionHealthStatus": "NEEDS_ATTENTION",
+  "alertingDelayMinutes": 3,
+  "conditionUid": {
+    "event": "b979707b-b370-40bc-b3bf-d498953ed8a2",
+    "service": "347443f1-c019-423c-8ab0-2f8ece3908d6"
+  },
+  "common": {
+    "events": [
+      { "name": "Windows Security Event Log Cleared", "eventIds": ["1102"] },
+      { "name": "Windows Security Event Log is Full", "eventIds": ["1104"] },
+      { "name": "Windows Firewall Service Stopped", "eventIds": ["5025", "5034"] },
+      { "name": "Windows Firewall Security Policy Issue", "eventIds": ["5027", "5028", "5029"] },
+      { "name": "Windows Firewall Failed", "eventIds": ["5030", "5035", "5037"] },
+      { "name": "Change Made to Windows Firewall Exceptions", "eventIds": ["4946", "4947", "4948"] },
+      { "name": "Windows Firewall Settings Changed", "eventIds": ["4950", "4951", "4854", "4956"] },
+      { "name": "DoS Attack Detected via Windows Filtering Platform", "eventIds": ["5148"] },
+      { "name": "Windows Filtering Platform Blocked a Packet", "eventIds": ["5150", "5151", "5152", "5153"] },
+      { "name": "Windows Filtering Platform Blocked a Connection", "eventIds": ["5155", "5157", "5159"] },
+      { "name": "Image File Hashes Incorrect", "eventIds": ["5038", "6281"] },
+      { "name": "User Account Created or Enabled", "eventIds": ["4720", "4722"] },
+      { "name": "User Account Disabled or Deleted", "eventIds": ["4725", "4726"] },
+      { "name": "User Account Password Change or Reset", "eventIds": ["4723", "4724"] },
+      { "name": "User Account Failed to Login", "eventIds": ["4625"] },
+      { "name": "User Account Locked Out", "eventIds": ["4740", "6279"] },
+      { "name": "User Account Unlocked", "eventIds": ["4767", "6280"] },
+      { "name": "Security-Enabled Group Created", "eventIds": ["4727", "4731", "4754"] },
+      { "name": "Security-Enabled Group Changed", "eventIds": ["4735", "4737"] },
+      { "name": "Security-Enabled Group Deleted", "eventIds": ["4730", "4734", "4758"] },
+      { "name": "Member Added to Security-Enabled Group", "eventIds": ["4728", "4732", "4756"] },
+      { "name": "Member Removed From Security-Enabled Group", "eventIds": ["4729", "4733", "4757"] },
+      { "name": "Security Group's Type Changed", "eventIds": ["4764"] },
+      { "name": "Failed Login Attempts: Event ID 2", "eventIds": ["4777"] },
+      { "name": "Failed Login Attempts: Event ID 1", "eventIds": ["4625"] }
+    ],
+    "services": [
+      { "name": "Windows Defender: Service Down", "include": ["windefend", "mpssvc", "MsMpEng", "Windows Defender Service"] },
+      { "name": "Windows Security Center Service is Down", "include": ["wscvsvc"] },
+      { "name": "Windows Security Account Manager is Down", "include": ["SamSs"] }
+    ]
+  },
+  "serverOnly": {
+    "events": [
+      { "name": "Domain Controller Failed to Validate Credentials", "eventIds": ["4777"] }
+    ],
+    "services": [
+      { "name": "Windows Server Update Services", "include": ["WSUSservice"] }
+    ]
+  }
+}
+'@
+
+    $hard = $null
+    try { $hard = $hardeningJson | ConvertFrom-Json -AsHashtable -Depth 100 } catch { }
+    if (-not $hard) {
+        Write-Host "[ERROR] Could not parse the embedded hardening definition." -ForegroundColor Red
+        $failed++
+    }
+    else {
+
+        $prefix       = [string]$hard.prefix
+        $eventSource  = [string]$hard.eventSource
+        $resetThresh  = [int]$hard.resetThreshold
+        $healthStatus = [string]$hard.conditionHealthStatus
+        $alertMinutes = [int]$hard.alertingDelayMinutes
+        $eventUid     = [string]$hard.conditionUid.event
+        $serviceUid   = [string]$hard.conditionUid.service
+
+        # nodeClass -> which definition buckets apply. 'common' goes on both; the
+        # Windows Server default additionally gets 'serverOnly'.
+        $moduleTargets = [ordered]@{
+            WINDOWS_WORKSTATION = @("common")
+            WINDOWS_SERVER      = @("common", "serverOnly")
+        }
+
+        foreach ($nodeClass in $moduleTargets.Keys) {
+            $default = $allPolicies | Where-Object { $_.nodeClass -eq $nodeClass -and $_.nodeClassDefault -eq $true } | Select-Object -First 1
+            if (-not $default) {
+                Write-Host ("[WARN] No default policy found for nodeClass '{0}' - skipping hardening." -f $nodeClass) -ForegroundColor Yellow
+                continue
+            }
+
+            # Collect the condition definitions that apply to this nodeClass.
+            $eventDefs   = [System.Collections.Generic.List[object]]::new()
+            $serviceDefs = [System.Collections.Generic.List[object]]::new()
+            foreach ($bucket in $moduleTargets[$nodeClass]) {
+                if ($hard[$bucket].events)   { foreach ($e in $hard[$bucket].events)   { $eventDefs.Add($e) } }
+                if ($hard[$bucket].services) { foreach ($s in $hard[$bucket].services) { $serviceDefs.Add($s) } }
+            }
+
+            # Load the full policy object (GET returns { resultCode, policy }).
+            $getResp = Invoke-NinjaApi -Method "GET" -Uri ("{0}/{1}" -f $policyUri, $default.id)
+            if ($getResp.Code -ge 400) {
+                Write-Host ("[ERROR {0}] could not load policy '{1}' (id {2}) - {3}" -f $getResp.Code, $default.name, $default.id, $getResp.Body) -ForegroundColor Red
+                $failed++
+                continue
+            }
+            $policyWrap = $getResp.Body | ConvertFrom-Json -AsHashtable -Depth 100
+            $policy = $policyWrap.policy
+            if (-not $policy) {
+                Write-Host ("[ERROR] policy payload missing for '{0}' (id {1})." -f $default.name, $default.id) -ForegroundColor Red
+                $failed++
+                continue
+            }
+
+            if (-not $policy.content)            { $policy.content = [ordered]@{} }
+            if (-not $policy.content.conditions) { $policy.content.conditions = [ordered]@{} }
+            $conditions = $policy.content.conditions
+
+            # Existing displayNames -> idempotency (skip conditions already present).
+            $existingNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($c in $conditions.Values) {
+                if ($c.displayName) { [void]$existingNames.Add([string]$c.displayName) }
+            }
+
+            $addedThisPolicy   = 0
+            $skippedThisPolicy = 0
+
+            foreach ($e in $eventDefs) {
+                $displayName = $prefix + [string]$e.name
+                if ($existingNames.Contains($displayName)) { $skippedThisPolicy++; continue }
+                $cond = Build-HardeningCondition -Type "event" -DisplayName $displayName `
+                    -EventIds @($e.eventIds) -EventSource $eventSource `
+                    -ResetThreshold $resetThresh -ConditionHealthStatus $healthStatus `
+                    -AlertingDelayMinutes $alertMinutes -ConditionUid $eventUid
+                $conditions[[guid]::NewGuid().ToString()] = $cond
+                [void]$existingNames.Add($displayName)
+                $addedThisPolicy++
+            }
+
+            foreach ($s in $serviceDefs) {
+                $displayName = $prefix + [string]$s.name
+                if ($existingNames.Contains($displayName)) { $skippedThisPolicy++; continue }
+                $cond = Build-HardeningCondition -Type "service" -DisplayName $displayName `
+                    -Include @($s.include) `
+                    -ResetThreshold $resetThresh -ConditionHealthStatus $healthStatus `
+                    -AlertingDelayMinutes $alertMinutes -ConditionUid $serviceUid
+                $conditions[[guid]::NewGuid().ToString()] = $cond
+                [void]$existingNames.Add($displayName)
+                $addedThisPolicy++
+            }
+
+            $skipped += $skippedThisPolicy
+
+            if ($addedThisPolicy -eq 0) {
+                Write-Host ("[OK] '{0}' already has all {1} hardening conditions." -f $policy.name, $skippedThisPolicy) -ForegroundColor DarkGray
+                continue
+            }
+
+            # PUT body is the full, unwrapped policy object; parentPolicyName is read-only.
+            if ($policy.Contains('parentPolicyName')) { [void]$policy.Remove('parentPolicyName') }
+            $putBody = $policy | ConvertTo-Json -Depth 100
+
+            if ($PSCmdlet.ShouldProcess($policy.name, ("PUT add {0} hardening conditions" -f $addedThisPolicy))) {
+                $r = Invoke-NinjaApi -Method "PUT" -Uri ("{0}/{1}" -f $policyUri, $default.id) -Body $putBody
+                if ($r.Code -lt 400) {
+                    Write-Host ("[OK {0}] '{1}' +{2} hardening conditions ({3} already present)" -f $r.Code, $policy.name, $addedThisPolicy, $skippedThisPolicy) -ForegroundColor Green
+                    $hardeningApplied += $addedThisPolicy
+                    $hardeningNames.Add(("{0}  (+{1})" -f $policy.name, $addedThisPolicy))
+                }
+                else {
+                    Write-Host ("[ERROR {0}] '{1}' - {2}" -f $r.Code, $policy.name, $r.Body) -ForegroundColor Red
+                    $failed++
+                }
+            }
+            else {
+                Write-Host ("[WhatIf] PUT '{0}'  +{1} hardening conditions ({2} already present)" -f $policy.name, $addedThisPolicy, $skippedThisPolicy)
             }
         }
     }
@@ -1292,11 +1635,15 @@ if ($createdNames.Count -gt 0) {
     Write-Host ("Created child policies ({0}):" -f $createdNames.Count)
     foreach ($n in $createdNames) { Write-Host ("  - {0}" -f $n) }
 }
+if ($hardeningNames.Count -gt 0) {
+    Write-Host ("Hardening conditions applied to default policies ({0}):" -f $hardeningNames.Count)
+    foreach ($n in $hardeningNames) { Write-Host ("  - {0}" -f $n) }
+}
 if ($rolesCreatedNames.Count -eq 0 -and $renamedNames.Count -eq 0 -and $createdNames.Count -eq 0 -and `
-    $techCreatedNames.Count -eq 0 -and $techUpdatedNames.Count -eq 0) {
+    $techCreatedNames.Count -eq 0 -and $techUpdatedNames.Count -eq 0 -and $hardeningNames.Count -eq 0) {
     Write-Host "Nothing changed - everything already matched the desired state."
 }
 Write-Host ""
-Write-Host ("Done. Node roles: {0}, Renamed: {1}, Child policies: {2}, Tech roles: +{3}/~{4}, Skipped: {5}, Failed: {6}" -f `
-    $rolesCreated, $renamed, $created, $techCreated, $techUpdated, $skipped, $failed)
+Write-Host ("Done. Node roles: {0}, Renamed: {1}, Child policies: {2}, Tech roles: +{3}/~{4}, Hardening: +{5}, Skipped: {6}, Failed: {7}" -f `
+    $rolesCreated, $renamed, $created, $techCreated, $techUpdated, $hardeningApplied, $skipped, $failed)
 if ($failed -gt 0) { exit 1 }

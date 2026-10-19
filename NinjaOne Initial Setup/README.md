@@ -1,9 +1,10 @@
 # NinjaOne Initial Setup
 
 One PowerShell script that bootstraps a fresh NinjaOne tenant in a single run: it creates the
-custom **node roles** and the matching **policy hierarchy** (default-policy naming convention +
-child policies) from a `-Roles` selection, and the **technician permission roles** (1st/2nd/3rd
-Level Support + Sys Admin) from a `-TechnicianRoles` selection.
+custom **node roles** from a `-Roles` selection, the matching **policy hierarchy** (default-policy
+naming convention + child policies) from a **separate** `-Policies` selection, and the **technician
+permission roles** (1st/2nd/3rd Level Support + Sys Admin) from a `-TechnicianRoles` selection.
+`-Roles` and `-Policies` are independent, so selecting a role no longer forces its policy.
 
 One script: [`Initialize-NinjaTenant.ps1`](Initialize-NinjaTenant.ps1).
 
@@ -14,15 +15,17 @@ One script: [`Initialize-NinjaTenant.ps1`](Initialize-NinjaTenant.ps1).
 - Authenticates with a **session cookie** (`sessionKey`) from a logged-in browser session.
 - **The session key is NOT stored in the script.** It comes from the `NINJA_SESSION_KEY`
   environment variable or the `-SessionKey` parameter.
-- `-Roles` and `-TechnicianRoles` are both **optional**: `-Roles server-all` for all server roles
-  (or short keys `sql,terminal`, …); `-TechnicianRoles tech-all` for all four technician profiles
-  (or individual keys).
+- `-Roles`, `-Policies` and `-TechnicianRoles` are all **optional** and independent:
+  `-Roles server-all` for all server node roles (or short keys `sql,terminal`, …);
+  `-Policies server-all` for the matching child policies; `-TechnicianRoles tech-all` for all four
+  technician profiles (or individual keys). Pass the same keys to both `-Roles` and `-Policies` to
+  get node roles AND their policies.
 - Four passes in one run:
-  1. **Node roles** (only with `-Roles`): one custom node role per selected role.
-  2. **Default policy naming** (with `-Roles`, or on a bare call): renames every built-in default
-     policy to the convention (`0.0`, `1.0`, `2.0`, …). Skipped on a technician-roles-only run.
-  3. **Child policies** (only with `-Roles`): one child policy per selected role, inheriting from
-     its default.
+  1. **Node roles** (only with `-Roles`): one custom node role per selected role. No policies.
+  2. **Default policy naming** (with `-Policies`, or on a bare call): renames every built-in default
+     policy to the convention (`0.0`, `1.0`, `2.0`, …). Skipped on a roles-only or tech-only run.
+  3. **Child policies** (only with `-Policies`): one child policy per selected policy, inheriting
+     from its default.
   4. **Technician roles** (only with `-TechnicianRoles`): create-or-update one technician role per
      selected permission profile.
 - Idempotent: existing roles, already-renamed defaults, already-existing children and technician
@@ -30,7 +33,9 @@ One script: [`Initialize-NinjaTenant.ps1`](Initialize-NinjaTenant.ps1).
 
 ```powershell
 $env:NINJA_SESSION_KEY = "<sessionKey-from-browser>"
-.\Initialize-NinjaTenant.ps1 -Roles server-all
+.\Initialize-NinjaTenant.ps1 -Roles server-all                      # node roles only
+.\Initialize-NinjaTenant.ps1 -Policies server-all                   # child policies only
+.\Initialize-NinjaTenant.ps1 -Roles server-all -Policies server-all # both
 .\Initialize-NinjaTenant.ps1 -TechnicianRoles tech-all
 ```
 
@@ -114,7 +119,7 @@ Each category (`nodeClass`) gets a **major** number. The built-in default policy
 | `LINUX_WORKSTATION` | 4 | `4.0 Linux Policy` |
 | `LINUX_SERVER` | 5 | `5.0 Linux Server Policy` |
 
-Child policies count up per category. Example for `-Roles terminal,sql`:
+Child policies count up per category. Example for `-Policies terminal,sql`:
 
 ```
 1.0 Windows Server Policy                       (default, renamed)
@@ -151,10 +156,22 @@ When the session expires you get `401`/`403` back - sign in again and grab the c
 
 ## Usage
 
-Full setup for all server roles (roles + renames + child policies `1.1`, `1.2`, …):
+Node roles only for all server roles (no policies touched):
 
 ```powershell
 .\Initialize-NinjaTenant.ps1 -Roles server-all
+```
+
+Child policies only for all server roles (renames + policies `1.1`, `1.2`, …, no node roles):
+
+```powershell
+.\Initialize-NinjaTenant.ps1 -Policies server-all
+```
+
+Full server setup - node roles AND their child policies:
+
+```powershell
+.\Initialize-NinjaTenant.ps1 -Roles server-all -Policies server-all
 ```
 
 Only enforce the naming convention on the default policies (no roles, no child policies):
@@ -163,10 +180,11 @@ Only enforce the naming convention on the default policies (no roles, no child p
 .\Initialize-NinjaTenant.ps1
 ```
 
-Only selected roles:
+Only selected roles / policies (same short-key grammar for both):
 
 ```powershell
 .\Initialize-NinjaTenant.ps1 -Roles sql,terminal
+.\Initialize-NinjaTenant.ps1 -Policies sql,terminal
 ```
 
 Mix groups and individual roles:
@@ -178,7 +196,7 @@ Mix groups and individual roles:
 Dry run - shows the planned roles, renames and child creates, sends nothing:
 
 ```powershell
-.\Initialize-NinjaTenant.ps1 -Roles server-all -WhatIf
+.\Initialize-NinjaTenant.ps1 -Roles server-all -Policies server-all -WhatIf
 ```
 
 Technician roles only (no device roles, no policy renames):
@@ -187,10 +205,10 @@ Technician roles only (no device roles, no policy renames):
 .\Initialize-NinjaTenant.ps1 -TechnicianRoles tech-all
 ```
 
-Everything in one run - device roles, policy hierarchy and technician roles:
+Everything in one run - node roles, policy hierarchy and technician roles:
 
 ```powershell
-.\Initialize-NinjaTenant.ps1 -Roles server-all -TechnicianRoles tech-all
+.\Initialize-NinjaTenant.ps1 -Roles server-all -Policies server-all -TechnicianRoles tech-all
 ```
 
 Session key for a single run, and a different instance:
@@ -205,7 +223,8 @@ Session key for a single run, and a different instance:
 
 | Parameter | Required | Default | Description |
 | --- | --- | --- | --- |
-| `-Roles` | no | (none) | Group keywords (`server-all`, `workstation-all`, `testlab`) and/or short keys (`datev,sql,terminal,…`). Omit to only enforce the default-policy naming convention |
+| `-Roles` | no | (none) | Device roles to create as **node roles** only (Pass 1). Group keywords (`server-all`, `workstation-all`, `testlab`) and/or short keys (`datev,sql,terminal,…`) |
+| `-Policies` | no | (none) | Device roles to create as **child policies** (Pass 3), independent of `-Roles`. Same grammar. Giving it also enforces the naming convention. Omit all three selection params to only enforce the naming convention |
 | `-TechnicianRoles` | no | (none) | Technician permission profiles: `1st-level-support`, `2nd-level-support`, `3rd-level-support`, `system-administrator`, or the group `tech-all`. Create-or-update by name |
 | `-SessionKey` | no | `$env:NINJA_SESSION_KEY` | Session cookie value. If both are missing, the script aborts with a clear message |
 | `-Region` | no | `eu` | Instance subdomain (`eu` -> `eu.ninjarmm.com`) |
