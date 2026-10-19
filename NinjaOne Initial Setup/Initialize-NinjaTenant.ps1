@@ -43,16 +43,18 @@
           GET/POST/PUT /swb/s6/user-roles
 
       Pass 5 - Monitoring modules (only when -Modules is given)
-          Applies a curated set of monitoring conditions to the DEFAULT (parent) policies so every
-          child policy inherits them. The only module today is "hardening" - a security-monitoring
-          condition set (Windows Event Log + Windows Service conditions) embedded directly in this
-          script, so no companion data file is needed. Every condition's display name is prefixed
-          "Hardening - ". The
-          'common' set lands on both the Windows Workstation (0.0) and Windows Server (1.0) defaults;
-          the 'serverOnly' set is added to the Windows Server default as well. Each default policy is
-          loaded whole (GET returns { resultCode, policy }), missing conditions are merged into
-          content.conditions (keyed by a fresh UUID, deduped by display name), the read-only
-          parentPolicyName field is dropped, and the full policy is saved back.
+          Applies curated sets of monitoring conditions to the DEFAULT (parent) policies so every
+          child policy inherits them. Modules are embedded directly in this script (no companion data
+          file needed) and each condition's display name carries a module-specific prefix:
+            - "hardening" - a security-monitoring condition set (Windows Event Log + Windows Service
+              conditions), prefix "Hardening - ". Its 'common' set lands on both the Windows
+              Workstation (0.0) and Windows Server (1.0) defaults; the 'serverOnly' set is added to
+              the Windows Server default as well.
+            - "dex" - a Digital Employee Experience set (performance / stability Windows Event Log
+              conditions), prefix "DEX - ", applied to the Windows Workstation (0.0) default only.
+          Each targeted default policy is loaded whole (GET returns { resultCode, policy }), missing
+          conditions are merged into content.conditions (keyed by a fresh UUID, deduped by display
+          name), the read-only parentPolicyName field is dropped, and the full policy is saved back.
           GET /swb/s6/policy/{id}  ->  PUT /swb/s6/policy/{id}  (full unwrapped policy object)
 
     A child policy links to its parent ONLY via parentPolicyId and inherits the parent's settings;
@@ -62,7 +64,7 @@
 
     Fully idempotent and -WhatIf-safe: existing node roles are skipped, defaults already carrying
     the convention name are left alone, an already-existing child is skipped, a technician role
-    already carrying exactly its profile is skipped, and a hardening condition already present on a
+    already carrying exactly its profile is skipped, and a module condition already present on a
     default policy (matched by display name) is not re-added. Safe to re-run.
 
     The sessionKey is a short-lived session cookie from a logged-in browser session. Once it
@@ -87,9 +89,11 @@
 
 .PARAMETER Modules
     Optional. One or more monitoring modules to apply to the default (parent) policies (Pass 5).
-    Supported value: hardening (a curated security-monitoring condition set, prefixed "Hardening - ").
-    e.g. -Modules hardening. A modules-only run loads the policies but does not rename them or create
-    node roles / child policies / technician roles.
+    Supported values (comma-separated): hardening (a curated security-monitoring condition set,
+    prefixed "Hardening - ", applied to the Workstation and Server defaults) and dex (a Digital
+    Employee Experience performance/stability set, prefixed "DEX - ", applied to the Workstation
+    default only). e.g. -Modules hardening,dex. A modules-only run loads the policies but does not
+    rename them or create node roles / child policies / technician roles.
 
 .PARAMETER SessionKey
     The sessionKey cookie value from the logged-in NinjaOne browser session.
@@ -135,9 +139,14 @@
     Server default policies (so every child policy inherits them) - nothing else is touched.
 
 .EXAMPLE
-    .\Initialize-NinjaTenant.ps1 -Roles server-all -Policies server-all -TechnicianRoles tech-all -Modules hardening -WhatIf
+    .\Initialize-NinjaTenant.ps1 -Modules hardening,dex
+    Applies the "hardening" set (Workstation + Server defaults) and the "dex" performance/stability
+    set (Workstation default only) so every child policy inherits them - nothing else is touched.
+
+.EXAMPLE
+    .\Initialize-NinjaTenant.ps1 -Roles server-all -Policies server-all -TechnicianRoles tech-all -Modules hardening,dex -WhatIf
     Dry run of the full tenant setup: node roles, policy renames, child policies, all four
-    technician roles and the hardening monitoring module - sends nothing.
+    technician roles and both monitoring modules (hardening + dex) - sends nothing.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -901,7 +910,7 @@ $hasTechSelection = $cleanTech.Count -gt 0
 $selectedTech     = if ($hasTechSelection) { Resolve-NinjaTechnicianSelection -Keys $cleanTech } else { $null }
 
 # -Modules drives monitoring modules applied to the default (parent) policies (Pass 5).
-$SupportedModules  = @("hardening")
+$SupportedModules  = @("hardening", "dex")
 $cleanModules      = @($Modules | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { $_.ToLowerInvariant() } | Select-Object -Unique)
 $unknownModules    = @($cleanModules | Where-Object { $SupportedModules -notcontains $_ })
 if ($unknownModules.Count -gt 0) {
@@ -978,7 +987,7 @@ function Invoke-NinjaApi {
 #   - "event"   : a Windows Event Log condition  (conditionUid = event GUID)
 #   - "service" : a Windows Service state condition (conditionUid = service GUID)
 # The type is carried by conditionUid; parameters define the specific condition.
-function Build-HardeningCondition {
+function Build-ModuleCondition {
     param(
         [Parameter(Mandatory)] [ValidateSet("event", "service")] [string] $Type,
         [Parameter(Mandatory)] [string] $DisplayName,
@@ -1071,13 +1080,13 @@ $skipped      = 0
 $failed       = 0
 $techCreated  = 0
 $techUpdated  = 0
-$hardeningApplied = 0
+$modulesApplied = 0
 $rolesCreatedNames = [System.Collections.Generic.List[string]]::new()  # created node roles
 $renamedNames      = [System.Collections.Generic.List[string]]::new()  # renamed default policies
 $createdNames      = [System.Collections.Generic.List[string]]::new()  # created child policies
 $techCreatedNames  = [System.Collections.Generic.List[string]]::new()  # created technician roles
 $techUpdatedNames  = [System.Collections.Generic.List[string]]::new()  # updated technician roles
-$hardeningNames    = [System.Collections.Generic.List[string]]::new()  # policies that got hardening conditions
+$moduleNames       = [System.Collections.Generic.List[string]]::new()  # "<module> -> <policy> (+N)" for applied conditions
 
 # =============================================================================
 # Pass 1: create custom node roles (only when -Roles is given)
@@ -1269,22 +1278,23 @@ if ($hasPolicySelection) {
 # =============================================================================
 # Pass 5: apply monitoring modules to the DEFAULT (parent) policies so every
 #         child policy inherits them (only when -Modules is given).
-#         Currently supported module: "hardening".
+#         Supported modules: "hardening" (security), "dex" (Digital Employee
+#         Experience).
 # =============================================================================
-# The curated condition set is embedded directly in this script (see the here-string
-# below), so a single .ps1 is all you need to run - no companion data file.
-# For each target nodeClass we load the full policy object (GET returns
+# Every module's curated condition set is embedded directly in this script (see the
+# here-strings below), so a single .ps1 is all you need to run - no companion data
+# file. For each target nodeClass we load the full policy object (GET returns
 # { resultCode, policy }), add any missing conditions into content.conditions
 # (keyed by a fresh UUID, deduped by displayName so re-runs are idempotent), drop
 # the read-only parentPolicyName field, then PUT the whole unwrapped policy back.
-if ($hasModuleSelection -and ($cleanModules -contains "hardening")) {
-    Write-Host "== Hardening monitoring conditions (default policies) =="
+# The apply logic below is module-agnostic: it is driven by $moduleCatalog, so
+# adding a module is just another embedded here-string plus a catalog entry.
+if ($hasModuleSelection) {
 
     # Curated hardening condition set — embedded as a here-string so the script is
-    # fully self-contained (no external hardening-conditions.json file needed). It is
-    # parsed into a hashtable so the rest of Pass 5 below stays exactly the same.
-    # 'common' goes on both the Windows Workstation (0.0) and Windows Server (1.0)
-    # default policies; 'serverOnly' is added to the Windows Server default only.
+    # fully self-contained (no external data file needed). 'common' goes on both the
+    # Windows Workstation (0.0) and Windows Server (1.0) default policies; 'serverOnly'
+    # is added to the Windows Server default only.
     $hardeningJson = @'
 {
   "prefix": "🛡️ Hardening - ",
@@ -1341,33 +1351,83 @@ if ($hasModuleSelection -and ($cleanModules -contains "hardening")) {
 }
 '@
 
-    $hard = $null
-    try { $hard = $hardeningJson | ConvertFrom-Json -AsHashtable -Depth 100 } catch { }
-    if (-not $hard) {
-        Write-Host "[ERROR] Could not parse the embedded hardening definition." -ForegroundColor Red
-        $failed++
-    }
-    else {
+    # Curated DEX (Digital Employee Experience) condition set — workstation-only,
+    # "stage 1" is event-only: slow boot / app / driver / service startup, slow
+    # shutdown, and application/system crashes that degrade day-to-day usability.
+    # Each event carries its own log 'source' (they span several providers), which
+    # overrides the module-level eventSource (null here).
+    $dexJson = @'
+{
+  "prefix": "💻 DEX - ",
+  "eventSource": null,
+  "resetThreshold": 14400,
+  "conditionHealthStatus": "NEEDS_ATTENTION",
+  "alertingDelayMinutes": 3,
+  "conditionUid": {
+    "event": "b979707b-b370-40bc-b3bf-d498953ed8a2",
+    "service": "347443f1-c019-423c-8ab0-2f8ece3908d6"
+  },
+  "workstation": {
+    "events": [
+      { "name": "Slow Boot", "source": "Microsoft-Windows-Diagnostics-Performance", "eventIds": ["100"] },
+      { "name": "Slow Application Startup", "source": "Microsoft-Windows-Diagnostics-Performance", "eventIds": ["101"] },
+      { "name": "Slow Driver Initialization", "source": "Microsoft-Windows-Diagnostics-Performance", "eventIds": ["102"] },
+      { "name": "Slow Service Startup", "source": "Microsoft-Windows-Diagnostics-Performance", "eventIds": ["103"] },
+      { "name": "Slow Shutdown", "source": "Microsoft-Windows-Diagnostics-Performance", "eventIds": ["200"] },
+      { "name": "Application Crash", "source": "Application Error", "eventIds": ["1000"] },
+      { "name": "Application Hang", "source": "Application Hang", "eventIds": ["1002"] },
+      { "name": "Unexpected Shutdown", "source": "EventLog", "eventIds": ["6008"] },
+      { "name": "Unexpected Power Loss or System Crash", "source": "Microsoft-Windows-Kernel-Power", "eventIds": ["41"] },
+      { "name": "Blue Screen Crash (Bugcheck)", "source": "BugCheck", "eventIds": ["1001"] }
+    ]
+  }
+}
+'@
 
-        $prefix       = [string]$hard.prefix
-        $eventSource  = [string]$hard.eventSource
-        $resetThresh  = [int]$hard.resetThreshold
-        $healthStatus = [string]$hard.conditionHealthStatus
-        $alertMinutes = [int]$hard.alertingDelayMinutes
-        $eventUid     = [string]$hard.conditionUid.event
-        $serviceUid   = [string]$hard.conditionUid.service
-
-        # nodeClass -> which definition buckets apply. 'common' goes on both; the
-        # Windows Server default additionally gets 'serverOnly'.
-        $moduleTargets = [ordered]@{
-            WINDOWS_WORKSTATION = @("common")
-            WINDOWS_SERVER      = @("common", "serverOnly")
+    # Module catalog: key -> (human title, embedded JSON, nodeClass -> buckets map).
+    # Only the modules named in -Modules run, in this stable order. Adding a module
+    # later means one more here-string above plus one more entry here.
+    $moduleCatalog = @(
+        [pscustomobject]@{
+            Key     = "hardening"
+            Title   = "Hardening monitoring conditions"
+            Json    = $hardeningJson
+            Targets = [ordered]@{ WINDOWS_WORKSTATION = @("common"); WINDOWS_SERVER = @("common", "serverOnly") }
         }
+        [pscustomobject]@{
+            Key     = "dex"
+            Title   = "DEX (Digital Employee Experience) monitoring conditions"
+            Json    = $dexJson
+            Targets = [ordered]@{ WINDOWS_WORKSTATION = @("workstation") }
+        }
+    )
+
+    foreach ($module in $moduleCatalog) {
+        if ($cleanModules -notcontains $module.Key) { continue }
+        Write-Host ("== {0} (default policies) ==" -f $module.Title)
+
+        $def = $null
+        try { $def = $module.Json | ConvertFrom-Json -AsHashtable -Depth 100 } catch { }
+        if (-not $def) {
+            Write-Host ("[ERROR] Could not parse the embedded '{0}' definition." -f $module.Key) -ForegroundColor Red
+            $failed++
+            Write-Host ""
+            continue
+        }
+
+        $prefix        = [string]$def.prefix
+        $defaultSource = [string]$def.eventSource
+        $resetThresh   = [int]$def.resetThreshold
+        $healthStatus  = [string]$def.conditionHealthStatus
+        $alertMinutes  = [int]$def.alertingDelayMinutes
+        $eventUid      = [string]$def.conditionUid.event
+        $serviceUid    = [string]$def.conditionUid.service
+        $moduleTargets = $module.Targets
 
         foreach ($nodeClass in $moduleTargets.Keys) {
             $default = $allPolicies | Where-Object { $_.nodeClass -eq $nodeClass -and $_.nodeClassDefault -eq $true } | Select-Object -First 1
             if (-not $default) {
-                Write-Host ("[WARN] No default policy found for nodeClass '{0}' - skipping hardening." -f $nodeClass) -ForegroundColor Yellow
+                Write-Host ("[WARN] No default policy found for nodeClass '{0}' - skipping {1}." -f $nodeClass, $module.Key) -ForegroundColor Yellow
                 continue
             }
 
@@ -1375,8 +1435,8 @@ if ($hasModuleSelection -and ($cleanModules -contains "hardening")) {
             $eventDefs   = [System.Collections.Generic.List[object]]::new()
             $serviceDefs = [System.Collections.Generic.List[object]]::new()
             foreach ($bucket in $moduleTargets[$nodeClass]) {
-                if ($hard[$bucket].events)   { foreach ($e in $hard[$bucket].events)   { $eventDefs.Add($e) } }
-                if ($hard[$bucket].services) { foreach ($s in $hard[$bucket].services) { $serviceDefs.Add($s) } }
+                if ($def[$bucket].events)   { foreach ($e in $def[$bucket].events)   { $eventDefs.Add($e) } }
+                if ($def[$bucket].services) { foreach ($s in $def[$bucket].services) { $serviceDefs.Add($s) } }
             }
 
             # Load the full policy object (GET returns { resultCode, policy }).
@@ -1410,8 +1470,10 @@ if ($hasModuleSelection -and ($cleanModules -contains "hardening")) {
             foreach ($e in $eventDefs) {
                 $displayName = $prefix + [string]$e.name
                 if ($existingNames.Contains($displayName)) { $skippedThisPolicy++; continue }
-                $cond = Build-HardeningCondition -Type "event" -DisplayName $displayName `
-                    -EventIds @($e.eventIds) -EventSource $eventSource `
+                # Per-event source wins over the module default (DEX events span providers).
+                $evSource = if ($e.source) { [string]$e.source } else { $defaultSource }
+                $cond = Build-ModuleCondition -Type "event" -DisplayName $displayName `
+                    -EventIds @($e.eventIds) -EventSource $evSource `
                     -ResetThreshold $resetThresh -ConditionHealthStatus $healthStatus `
                     -AlertingDelayMinutes $alertMinutes -ConditionUid $eventUid
                 $conditions[[guid]::NewGuid().ToString()] = $cond
@@ -1422,7 +1484,7 @@ if ($hasModuleSelection -and ($cleanModules -contains "hardening")) {
             foreach ($s in $serviceDefs) {
                 $displayName = $prefix + [string]$s.name
                 if ($existingNames.Contains($displayName)) { $skippedThisPolicy++; continue }
-                $cond = Build-HardeningCondition -Type "service" -DisplayName $displayName `
+                $cond = Build-ModuleCondition -Type "service" -DisplayName $displayName `
                     -Include @($s.include) `
                     -ResetThreshold $resetThresh -ConditionHealthStatus $healthStatus `
                     -AlertingDelayMinutes $alertMinutes -ConditionUid $serviceUid
@@ -1434,7 +1496,7 @@ if ($hasModuleSelection -and ($cleanModules -contains "hardening")) {
             $skipped += $skippedThisPolicy
 
             if ($addedThisPolicy -eq 0) {
-                Write-Host ("[OK] '{0}' already has all {1} hardening conditions." -f $policy.name, $skippedThisPolicy) -ForegroundColor DarkGray
+                Write-Host ("[OK] '{0}' already has all {1} {2} conditions." -f $policy.name, $skippedThisPolicy, $module.Key) -ForegroundColor DarkGray
                 continue
             }
 
@@ -1442,12 +1504,12 @@ if ($hasModuleSelection -and ($cleanModules -contains "hardening")) {
             if ($policy.Contains('parentPolicyName')) { [void]$policy.Remove('parentPolicyName') }
             $putBody = $policy | ConvertTo-Json -Depth 100
 
-            if ($PSCmdlet.ShouldProcess($policy.name, ("PUT add {0} hardening conditions" -f $addedThisPolicy))) {
+            if ($PSCmdlet.ShouldProcess($policy.name, ("PUT add {0} {1} conditions" -f $addedThisPolicy, $module.Key))) {
                 $r = Invoke-NinjaApi -Method "PUT" -Uri ("{0}/{1}" -f $policyUri, $default.id) -Body $putBody
                 if ($r.Code -lt 400) {
-                    Write-Host ("[OK {0}] '{1}' +{2} hardening conditions ({3} already present)" -f $r.Code, $policy.name, $addedThisPolicy, $skippedThisPolicy) -ForegroundColor Green
-                    $hardeningApplied += $addedThisPolicy
-                    $hardeningNames.Add(("{0}  (+{1})" -f $policy.name, $addedThisPolicy))
+                    Write-Host ("[OK {0}] '{1}' +{2} {3} conditions ({4} already present)" -f $r.Code, $policy.name, $addedThisPolicy, $module.Key, $skippedThisPolicy) -ForegroundColor Green
+                    $modulesApplied += $addedThisPolicy
+                    $moduleNames.Add(("{0} -> {1}  (+{2})" -f $module.Key, $policy.name, $addedThisPolicy))
                 }
                 else {
                     Write-Host ("[ERROR {0}] '{1}' - {2}" -f $r.Code, $policy.name, $r.Body) -ForegroundColor Red
@@ -1455,11 +1517,11 @@ if ($hasModuleSelection -and ($cleanModules -contains "hardening")) {
                 }
             }
             else {
-                Write-Host ("[WhatIf] PUT '{0}'  +{1} hardening conditions ({2} already present)" -f $policy.name, $addedThisPolicy, $skippedThisPolicy)
+                Write-Host ("[WhatIf] PUT '{0}'  +{1} {2} conditions ({3} already present)" -f $policy.name, $addedThisPolicy, $module.Key, $skippedThisPolicy)
             }
         }
+        Write-Host ""
     }
-    Write-Host ""
 }
 
 # =============================================================================
@@ -1635,15 +1697,15 @@ if ($createdNames.Count -gt 0) {
     Write-Host ("Created child policies ({0}):" -f $createdNames.Count)
     foreach ($n in $createdNames) { Write-Host ("  - {0}" -f $n) }
 }
-if ($hardeningNames.Count -gt 0) {
-    Write-Host ("Hardening conditions applied to default policies ({0}):" -f $hardeningNames.Count)
-    foreach ($n in $hardeningNames) { Write-Host ("  - {0}" -f $n) }
+if ($moduleNames.Count -gt 0) {
+    Write-Host ("Module conditions applied to default policies ({0}):" -f $moduleNames.Count)
+    foreach ($n in $moduleNames) { Write-Host ("  - {0}" -f $n) }
 }
 if ($rolesCreatedNames.Count -eq 0 -and $renamedNames.Count -eq 0 -and $createdNames.Count -eq 0 -and `
-    $techCreatedNames.Count -eq 0 -and $techUpdatedNames.Count -eq 0 -and $hardeningNames.Count -eq 0) {
+    $techCreatedNames.Count -eq 0 -and $techUpdatedNames.Count -eq 0 -and $moduleNames.Count -eq 0) {
     Write-Host "Nothing changed - everything already matched the desired state."
 }
 Write-Host ""
-Write-Host ("Done. Node roles: {0}, Renamed: {1}, Child policies: {2}, Tech roles: +{3}/~{4}, Hardening: +{5}, Skipped: {6}, Failed: {7}" -f `
-    $rolesCreated, $renamed, $created, $techCreated, $techUpdated, $hardeningApplied, $skipped, $failed)
+Write-Host ("Done. Node roles: {0}, Renamed: {1}, Child policies: {2}, Tech roles: +{3}/~{4}, Modules: +{5}, Skipped: {6}, Failed: {7}" -f `
+    $rolesCreated, $renamed, $created, $techCreated, $techUpdated, $modulesApplied, $skipped, $failed)
 if ($failed -gt 0) { exit 1 }
