@@ -410,14 +410,25 @@ function Invoke-NinjaApi {
             return $elevated
         }
 
+        # The step-up can report an error (e.g. HTTP 400/503) yet still elevate the session
+        # server-side. Before trusting the error, re-issue the original request: if it is no
+        # longer challenged the elevation actually took effect, so return it without a
+        # misleading "rejected" message or an unnecessary re-prompt.
+        $resp = Invoke-NinjaApiRaw -Method $Method -Uri $Uri -Body $Body
+        if ($resp.Code -ne 406) {
+            if ($resp.Code -lt 400) { $script:MfaElevated = $true }
+            return $resp
+        }
+
+        # Still challenged -> the code really was expired, already used, or wrong. Ask for a
+        # fresh one (interactive) and retry against the brand-new loginToken now in $resp; if we
+        # cannot prompt, stop with guidance.
         if (-not (Test-NinjaCanPrompt)) {
             throw ("MFA step-up rejected (HTTP $($elevated.Code)). The one-time code was expired, " +
                 "already used, or wrong, and stdin is not interactive so no fresh code can be " +
                 "requested. Generate a fresh code immediately before the run, or run interactively.")
         }
         Write-Host "MFA code rejected (HTTP $($elevated.Code)) - it was expired or already used. Enter a fresh one." -ForegroundColor Yellow
-        $resp = Invoke-NinjaApiRaw -Method $Method -Uri $Uri -Body $Body
-        if ($resp.Code -ne 406) { return $resp }
     }
 }
 
@@ -447,6 +458,11 @@ function Enter-NinjaMfaElevation {
         Write-Host "MFA: session elevated up front via -MfaCode (step-up accepted)." -ForegroundColor Cyan
         Write-Host ""
     }
+    # The -MFA code only had to open the elevation window. Whether it was spent on the step-up
+    # above or the session was already elevated (the no-op PUT returned 200 without a challenge),
+    # the code is now aged (~30s TOTP lifetime) and must never be blind-retried on a later mid-run
+    # challenge - drop it so the next challenge prompts for a genuinely fresh code.
+    $script:CurrentMfaCode = $null
 }
 
 # =============================================================================
