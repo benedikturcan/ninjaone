@@ -60,15 +60,34 @@
           name), the read-only parentPolicyName field is dropped, and the full policy is saved back.
           GET /swb/s6/policy/{id}  ->  PUT /swb/s6/policy/{id}  (full unwrapped policy object)
 
-      Pass 6 - DEX Survey device custom fields (only when -Modules includes "dex")
-          Provisions the DEVICE (NODE) custom fields the "DEX Survey" automation writes to, named
-          exactly as those scripts prescribe so the field names line up with the scripts' parameter
-          defaults: latestUserFeedback (Multi-line) and userFeedbackHistory (WYSIWYG). Each is created
-          with its Automations permission set to Read/Write (scriptPermission = READ_WRITE) so the
-          SYSTEM-run DEX scripts can write it - the UI default (None) would silently block the write.
-          Device custom fields are tenant-wide, so this pass is independent of the policy the dex
-          module targets. Idempotent: an existing field (matched by fieldName) is skipped.
-          GET /swb/s6/attributes/node/definitionScope/NODE  ->  POST /swb/s6/attributes/node
+      Pass 6 - DEX Survey custom fields (only when -Modules includes "dex")
+          Provisions the custom fields the "DEX Survey" scripts write to, named so the field names
+          line up with the scripts' parameter defaults (device fields) or with the name Pass 8 wires
+          into the automation (the global field): latestUserFeedback (Multi-line, device) and
+          userFeedbackHistory (WYSIWYG, device), each with Automations = Read/Write so the SYSTEM-run
+          DEX scripts can write them; plus systemPerformanceReport (WYSIWYG, GLOBAL / system custom
+          field) written WRITE_ONLY by "System Performance Check". The UI default (None) would silently
+          block any script write. Custom fields are tenant-wide, so this pass is independent of the
+          policy the dex module targets. Idempotent: an existing field (matched by fieldName within
+          the same scope) is skipped.
+          GET /swb/s6/attributes/node/definitionScope/{NODE|GLOBAL}  ->  POST /swb/s6/attributes/node
+
+      Pass 7 - Import DEX Survey scripts into the tenant library (only when -Modules includes "dex")
+          Copies the three DEX Survey scripts (Request User Feedback, Collect User Feedback, System
+          Performance Check) from the read-only NinjaOne global template library into the tenant's own
+          Automation library so they can be scheduled. Each template is loaded whole (code +
+          scriptVariables + uid) and POSTed to the tenant library carrying sourceGlobalScriptUid.
+          Idempotent: a tenant script already linked to the same template or sharing its name is reused.
+          GET /swb/s6/global-scripting/scripts[/{id}]  +  GET/POST /swb/s6/scripting/scripts
+
+      Pass 8 - Wire DEX Survey as a scheduled automation (only when -Modules includes "dex")
+          Schedules the three imported scripts as ONE ordered actionset ("DEX Survey") on the Windows
+          Workstation default policy (same policy Pass 5 targets), so every workstation child policy
+          inherits it. Runs weekly (Monday 10:00 local); scripts run in order (Request as the logged-on
+          user, then Collect and Performance as SYSTEM). Script 3's "WYSIWYG Custom Field Name" variable
+          is pointed at the global systemPerformanceReport field from Pass 6. The entry is spliced into
+          policy.content.actionsetSchedules (idempotent on actionsetScheduleName) and the whole policy
+          is saved back. GET /swb/s6/policy/{id}  ->  PUT /swb/s6/policy/{id}
 
     A child policy links to its parent ONLY via parentPolicyId and inherits the parent's settings;
     it is not tied to the custom node role, so the policy passes do not depend on the role pass. This
@@ -82,6 +101,12 @@
 
     The sessionKey is a short-lived session cookie from a logged-in browser session. Once it
     expires you get 401/403 back - sign in again in the browser and pass the current value.
+
+    Privileged writes (Pass 5 conditions, Pass 8 automation) are MFA-gated: without an elevated
+    session they answer HTTP 406 with { resultCode:"MFA_REQUIRED", loginToken, mfaType:"TOTP" }.
+    Passing -MfaCode (the current TOTP) lets the script elevate non-interactively - on the first
+    406 it re-sends the request to "{url}/mfa" with the loginToken plus the code, exactly as the web
+    UI does. One successful step-up lifts the whole session for a short window, covering the run.
 
 .PARAMETER Roles
     Optional. One or more device roles to create as custom node roles (Pass 1 only - no policies).
@@ -106,15 +131,28 @@
     prefixed "Hardening - ", applied to the Workstation and Server defaults) and dex (a Digital
     Employee Experience set, prefixed "DEX - ", applied to the Workstation default only; event-based
     stage 1 plus performance / health metric conditions in stage 2). e.g. -Modules hardening,dex.
-    Selecting "dex" also provisions the DEX Survey device custom fields (Pass 6): latestUserFeedback
-    (Multi-line) and userFeedbackHistory (WYSIWYG), each with Automations = Read/Write so the
-    SYSTEM-run DEX Survey scripts can write them. A modules-only run loads the policies but does not
-    rename them or create node roles / child policies / technician roles.
+    Selecting "dex" also (a) provisions the DEX Survey custom fields (Pass 6): latestUserFeedback
+    (Multi-line, device) and userFeedbackHistory (WYSIWYG, device), each with Automations = Read/Write,
+    plus systemPerformanceReport (WYSIWYG, global/system) written WRITE_ONLY; (b) imports the three
+    DEX Survey scripts into the tenant library (Pass 7); and (c) wires them as one weekly scheduled
+    automation ("DEX Survey") on the Windows Workstation default policy (Pass 8). A modules-only run
+    loads the policies but does not rename them or create node roles / child policies / technician roles.
 
 .PARAMETER SessionKey
     The sessionKey cookie value from the logged-in NinjaOne browser session.
     If omitted, the script reads the NINJA_SESSION_KEY environment variable.
     The key is intentionally NOT stored in the script (secret).
+
+.PARAMETER MfaCode
+    Optional. The current 6-digit MFA (TOTP) code for the signed-in user. Privileged writes
+    (applying monitoring conditions in Pass 5, wiring the scheduled automation in Pass 8) answer
+    HTTP 406 (MFA_REQUIRED) until the session is elevated. When supplied, the script performs the
+    same step-up the web UI does: on the first 406 it re-sends the request to "{url}/mfa" with the
+    one-time loginToken from the 406 plus this code. A successful step-up elevates the whole session
+    for a short window, so one code generated immediately before the run normally covers every gated
+    write. If omitted, those writes fail with 406 and the response explains MFA is required.
+    If omitted, the script reads the NINJA_MFA_CODE environment variable. NEVER hardcode it (secret,
+    and it expires within ~30 seconds).
 
 .PARAMETER Region
     The NinjaOne instance subdomain (e.g. 'eu', 'app', 'us2'). Default: eu.
@@ -160,6 +198,12 @@
     set (Workstation default only) so every child policy inherits them - nothing else is touched.
 
 .EXAMPLE
+    .\Initialize-NinjaTenant.ps1 -Modules dex -MfaCode 123456
+    Applies the full "dex" module (conditions, custom fields, script import, scheduled automation).
+    Because those are MFA-gated writes, the current TOTP is passed so the script elevates the session
+    non-interactively on the first 406. Generate the code immediately before running (it expires fast).
+
+.EXAMPLE
     .\Initialize-NinjaTenant.ps1 -Roles server-all -Policies server-all -TechnicianRoles tech-all -Modules hardening,dex -WhatIf
     Dry run of the full tenant setup: node roles, policy renames, child policies, all four
     technician roles and both monitoring modules (hardening + dex) - sends nothing.
@@ -186,6 +230,17 @@ param(
 
     [Parameter()]
     [string] $SessionKey = $env:NINJA_SESSION_KEY,
+
+    # Optional: current 6-digit MFA (TOTP) code. Privileged writes (e.g. applying monitoring
+    # conditions in Pass 5, wiring scheduled automations in Pass 8) answer HTTP 406
+    # (MFA_REQUIRED) until the session is elevated. Supplying the TOTP lets the script elevate
+    # the session non-interactively: on the first 406 it re-sends the request to "{uri}/mfa"
+    # with the one-time loginToken plus this code. NinjaOne then elevates the whole session for
+    # a short window, so a single code generated right before the run normally covers every
+    # gated write. NEVER hardcode this - pass it at runtime (or via $env:NINJA_MFA_CODE).
+    [Parameter()]
+    [Alias('MFA')]
+    [string] $MfaCode = $env:NINJA_MFA_CODE,
 
     [Parameter()]
     [ValidateNotNullOrEmpty()]
@@ -947,8 +1002,11 @@ $noderoleListUri   = "$baseUrl/swb/s6/noderole/list?allRoles=true"
 $policyUri         = "$baseUrl/swb/s6/policy"
 $policyListUri     = "$baseUrl/swb/s6/policy/list"
 $userRolesEndpoint = "$baseUrl/swb/s6/user-roles"
-$attributesNodeUri     = "$baseUrl/swb/s6/attributes/node"                       # POST create a device (NODE) custom field
-$attributesNodeListUri = "$baseUrl/swb/s6/attributes/node/definitionScope/NODE"  # GET list device custom fields
+$attributesNodeUri        = "$baseUrl/swb/s6/attributes/node"                         # POST create a custom field (device or global)
+$attributesNodeListUri    = "$baseUrl/swb/s6/attributes/node/definitionScope/NODE"    # GET list device (NODE) custom fields
+$attributesGlobalListUri  = "$baseUrl/swb/s6/attributes/node/definitionScope/GLOBAL"  # GET list global/system custom fields
+$globalScriptsUri         = "$baseUrl/swb/s6/global-scripting/scripts"                # GET NinjaOne template library (list + /{id} detail)
+$scriptsUri               = "$baseUrl/swb/s6/scripting/scripts"                       # GET tenant script library / POST import a script
 $userAgent       = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.0.0 Safari/537.36"
 
 # .NET HttpClient with AllowAutoRedirect=$false: the create POSTs answer with a redirect to an
@@ -974,7 +1032,7 @@ $headers = [ordered]@{
 }
 
 # Sends one request via HttpClient. Returns @{ Code; Body }.
-function Invoke-NinjaApi {
+function Invoke-NinjaApiRaw {
     param(
         [Parameter(Mandatory)] [string] $Method,
         [Parameter(Mandatory)] [string] $Uri,
@@ -998,6 +1056,56 @@ function Invoke-NinjaApi {
         if ($resp) { $resp.Dispose() }
         if ($req)  { $req.Dispose() }
     }
+}
+
+# Tracks whether an MFA step-up has already succeeded this run (for the summary only).
+$script:MfaElevated = $false
+
+# Sends one request and transparently handles NinjaOne's MFA step-up. Privileged writes
+# answer HTTP 406 with a body like
+#   { "resultCode":"MFA_REQUIRED", "loginToken":"<uuid>", "mfaType":"TOTP", ... }
+# The web UI then re-saves the same model to "{url}/mfa" with the one-time loginToken and the
+# user's TOTP (mfaCode) merged into the body. We replicate exactly that: on a 406, if -MfaCode
+# was supplied, re-send the identical request to "{Uri}/mfa" with loginToken + mfaCode added at
+# the top level of the JSON body. A successful elevation lifts the whole session for a short
+# window, so subsequent writes in the same run simply return < 400 and never reach this branch.
+function Invoke-NinjaApi {
+    param(
+        [Parameter(Mandatory)] [string] $Method,
+        [Parameter(Mandatory)] [string] $Uri,
+        [string] $Body
+    )
+    $resp = Invoke-NinjaApiRaw -Method $Method -Uri $Uri -Body $Body
+
+    if ($resp.Code -ne 406 -or [string]::IsNullOrWhiteSpace($MfaCode)) {
+        return $resp
+    }
+
+    $mfa = $null
+    try { $mfa = $resp.Body | ConvertFrom-Json } catch { }
+    $isMfa = $mfa -and $mfa.PSObject.Properties['resultCode'] -and $mfa.resultCode -eq 'MFA_REQUIRED'
+    if (-not $isMfa) { return $resp }
+
+    $loginToken = if ($mfa.PSObject.Properties['loginToken']) { [string]$mfa.loginToken } else { $null }
+
+    # Merge the current body (an object) with loginToken + mfaCode. -AsHashtable keeps the
+    # nested structure intact; booleans/nulls/numbers round-trip through ConvertTo-Json.
+    $payload = [ordered]@{}
+    if (-not [string]::IsNullOrEmpty($Body)) {
+        $parsed = $Body | ConvertFrom-Json -AsHashtable
+        if ($parsed -is [System.Collections.IDictionary]) {
+            foreach ($k in $parsed.Keys) { $payload[$k] = $parsed[$k] }
+        }
+    }
+    $payload['loginToken'] = $loginToken
+    $payload['mfaCode']    = ($MfaCode).Trim()
+
+    $mfaBody = $payload | ConvertTo-Json -Depth 100 -Compress
+    $mfaUri  = ($Uri -replace '/+$', '') + '/mfa'
+
+    $elevated = Invoke-NinjaApiRaw -Method $Method -Uri $mfaUri -Body $mfaBody
+    if ($elevated.Code -lt 400) { $script:MfaElevated = $true }
+    return $elevated
 }
 
 # Build one fully-formed monitoring condition in the shape NinjaOne persists inside
@@ -1121,13 +1229,17 @@ $techCreated  = 0
 $techUpdated  = 0
 $modulesApplied = 0
 $customFieldsCreated = 0
+$scriptsImported  = 0
+$automationsWired = 0
 $rolesCreatedNames = [System.Collections.Generic.List[string]]::new()  # created node roles
 $renamedNames      = [System.Collections.Generic.List[string]]::new()  # renamed default policies
 $createdNames      = [System.Collections.Generic.List[string]]::new()  # created child policies
 $techCreatedNames  = [System.Collections.Generic.List[string]]::new()  # created technician roles
 $techUpdatedNames  = [System.Collections.Generic.List[string]]::new()  # updated technician roles
 $moduleNames       = [System.Collections.Generic.List[string]]::new()  # "<module> -> <policy> (+N)" for applied conditions
-$customFieldNames  = [System.Collections.Generic.List[string]]::new()  # "<fieldName> (<type>)" for created device custom fields
+$customFieldNames  = [System.Collections.Generic.List[string]]::new()  # "<fieldName> (<type>)" for created custom fields
+$scriptLibNames    = [System.Collections.Generic.List[string]]::new()  # "<name> (id <n>)" for imported DEX Survey scripts
+$automationNames   = [System.Collections.Generic.List[string]]::new()  # "<automation> -> <policy>" for wired scheduled automations
 
 # =============================================================================
 # Pass 1: create custom node roles (only when -Roles is given)
@@ -1638,56 +1750,76 @@ if ($hasModuleSelection) {
 }
 
 # =============================================================================
-# Pass 6: DEX Survey device custom fields (only when -Modules includes "dex")
+# Pass 6: DEX Survey custom fields (only when -Modules includes "dex")
 # =============================================================================
-# The "DEX Survey" automation from the NinjaOne script template library ("Request
-# User Feedback", "Collect User Feedback", "System Performance Check") persists its
-# results into DEVICE (NODE) custom fields via Ninja-Property-Set. Those scripts run
-# under the SYSTEM account, and a SYSTEM/automation write only succeeds if the field's
-# Automations permission is Read/Write (scriptPermission = READ_WRITE); the UI default
-# is None, which silently blocks the write. This pass provisions the two fields the DEX
-# Survey scripts prescribe BY NAME, so the field names line up with the scripts' own
-# parameter defaults and no manual wiring is needed:
-#   - latestUserFeedback  (Multi-line) <- "Collect User Feedback" $MultilineCustomFieldName
-#   - userFeedbackHistory (WYSIWYG)    <- "Collect User Feedback" $WYSIWYGCustomFieldName
-# ("System Performance Check" also writes a WYSIWYG field, but its script variable has
-# no prescribed default name - the admin points it at a field at run time - so we do not
-# invent one here.) Device custom fields are tenant-wide (not policy-scoped), so this pass
-# is independent of which default policy the dex module (Pass 5) targets. Idempotent:
-# an existing field (matched by fieldName, case-insensitive) is skipped.
-#   GET  /swb/s6/attributes/node/definitionScope/NODE   (existing fields - idempotency)
-#   POST /swb/s6/attributes/node                          (create one missing field)
+# The "DEX Survey" scripts from the NinjaOne script template library ("Request User
+# Feedback", "Collect User Feedback", "System Performance Check") persist their results
+# into custom fields via Ninja-Property-Set. Those scripts run under SYSTEM (or the
+# logged-on user), and a script write only succeeds if the field's Automations permission
+# allows writing; the UI default is None, which silently blocks the write. This pass
+# provisions the fields the DEX Survey scripts write to, named so the field names line up
+# with the scripts' own parameter defaults (device fields) or with the name Pass 8 wires
+# into the automation (the global field):
+#   - latestUserFeedback    (Multi-line, NODE)   <- "Collect User Feedback" $MultilineCustomFieldName
+#   - userFeedbackHistory   (WYSIWYG,    NODE)   <- "Collect User Feedback" $WYSIWYGCustomFieldName
+#   - systemPerformanceReport (WYSIWYG, GLOBAL)  <- "System Performance Check" $WYSIWYGCustomFieldName (wired in Pass 8)
+# The first two are DEVICE (NODE) fields, scriptPermission Read/Write (SYSTEM scripts
+# write them). The third is a GLOBAL / system custom field (Administration > General >
+# System custom fields), written WRITE_ONLY by "System Performance Check" - that script's
+# WYSIWYG target has no prescribed default name, so we create the field here and point the
+# scheduled automation (Pass 8) at it by name. Custom fields are tenant-wide (not policy-
+# scoped), so this pass is independent of which default policy the dex module (Pass 5)
+# targets. Idempotent: an existing field (matched by fieldName within the same scope,
+# case-insensitive) is skipped.
+#   GET  /swb/s6/attributes/node/definitionScope/NODE     (existing device fields - idempotency)
+#   GET  /swb/s6/attributes/node/definitionScope/GLOBAL   (existing global fields - idempotency)
+#   POST /swb/s6/attributes/node                           (create one missing field)
 if ($hasModuleSelection -and ($cleanModules -contains "dex")) {
-    Write-Host "== DEX Survey device custom fields =="
+    Write-Host "== DEX Survey custom fields =="
 
-    # The two fields the DEX Survey scripts write to, named exactly as the scripts expect.
+    # The fields the DEX Survey scripts write to, named exactly as the scripts expect.
     # attributeType drives the field type; advancedSettings is WYSIWYG-only (null otherwise).
+    # scope selects the field's definitionScope (NODE = per-device, GLOBAL = system-level);
+    # scriptPermission is the Automations permission (READ_WRITE lets scripts read+write,
+    # WRITE_ONLY lets them only write - enough for a report field the script only fills).
     $dexCustomFields = @(
-        [ordered]@{ fieldName = "latestUserFeedback";  label = "Latest User Feedback";  attributeType = "TEXT_MULTILINE"; advancedSettings = $null }
-        [ordered]@{ fieldName = "userFeedbackHistory"; label = "User Feedback History"; attributeType = "WYSIWYG";        advancedSettings = [ordered]@{ expandLargeValueOnRender = $false } }
+        [ordered]@{ fieldName = "latestUserFeedback";      label = "Latest User Feedback";      attributeType = "TEXT_MULTILINE"; advancedSettings = $null;                                              scope = "NODE";   scriptPermission = "READ_WRITE" }
+        [ordered]@{ fieldName = "userFeedbackHistory";     label = "User Feedback History";     attributeType = "WYSIWYG";        advancedSettings = [ordered]@{ expandLargeValueOnRender = $false };     scope = "NODE";   scriptPermission = "READ_WRITE" }
+        [ordered]@{ fieldName = "systemPerformanceReport"; label = "System Performance Report"; attributeType = "WYSIWYG";        advancedSettings = [ordered]@{ expandLargeValueOnRender = $false };     scope = "GLOBAL"; scriptPermission = "WRITE_ONLY" }
     )
 
-    # Existing NODE custom fields -> case-insensitive set of field names for idempotency.
-    $existingFieldNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    $cfListResp = Invoke-NinjaApi -Method "GET" -Uri $attributesNodeListUri
-    if ($cfListResp.Code -ge 400) {
-        Write-Host ("[ERROR {0}] could not list device custom fields - {1}" -f $cfListResp.Code, $cfListResp.Body) -ForegroundColor Red
-        $failed++
+    # Existing custom fields per scope -> case-insensitive sets of field names for idempotency.
+    # A field name can legitimately exist in both scopes, so each scope is tracked separately.
+    $existingByScope = @{
+        NODE   = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        GLOBAL = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     }
-    else {
-        $cfList = $cfListResp.Body | ConvertFrom-Json
-        foreach ($f in @($cfList)) {
-            if ($f.PSObject.Properties['fieldName'] -and $f.fieldName) { [void]$existingFieldNames.Add([string]$f.fieldName) }
+    $cfListOk = $true
+    foreach ($scopePair in @(@{ Scope = "NODE"; Uri = $attributesNodeListUri }, @{ Scope = "GLOBAL"; Uri = $attributesGlobalListUri })) {
+        $cfListResp = Invoke-NinjaApi -Method "GET" -Uri $scopePair.Uri
+        if ($cfListResp.Code -ge 400) {
+            Write-Host ("[ERROR {0}] could not list {1} custom fields - {2}" -f $cfListResp.Code, $scopePair.Scope, $cfListResp.Body) -ForegroundColor Red
+            $failed++
+            $cfListOk = $false
+            continue
         }
+        foreach ($f in @($cfListResp.Body | ConvertFrom-Json)) {
+            if ($f.PSObject.Properties['fieldName'] -and $f.fieldName) { [void]$existingByScope[$scopePair.Scope].Add([string]$f.fieldName) }
+        }
+    }
 
+    if ($cfListOk) {
         foreach ($spec in $dexCustomFields) {
-            if ($existingFieldNames.Contains($spec['fieldName'])) {
-                Write-Host ("[skip] device custom field '{0}' already exists" -f $spec['fieldName']) -ForegroundColor DarkGray
+            $scope     = [string]$spec['scope']
+            $scopeWord = if ($scope -eq "GLOBAL") { "global custom field" } else { "device custom field" }
+            if ($existingByScope[$scope].Contains($spec['fieldName'])) {
+                Write-Host ("[skip] {0} '{1}' already exists" -f $scopeWord, $spec['fieldName']) -ForegroundColor DarkGray
                 continue
             }
 
-            # Create body captured verbatim from the web UI's POST, with Automations =
-            # Read/Write (scriptPermission) so the SYSTEM-run DEX Survey scripts can write it.
+            # Create body captured verbatim from the web UI's POST; scriptPermission
+            # (Automations) lets the DEX scripts write the field, definitionScope selects
+            # device (NODE) vs global/system (GLOBAL).
             $content = [ordered]@{
                 values           = @()
                 required         = $false
@@ -1703,21 +1835,21 @@ if ($hasModuleSelection -and ($cleanModules -contains "dex")) {
                 description           = ""
                 defaultValue          = $null
                 technicianOption      = "OPTIONAL"
-                scriptPermission      = "READ_WRITE"   # Automations: Read/Write (lets SYSTEM scripts write)
+                scriptPermission      = $spec['scriptPermission']   # Automations permission (lets DEX scripts write)
                 apiPermission         = "NONE"
                 technicianPermission  = "EDITABLE"
                 technicianPermissions = @()
-                definitionScope       = @("NODE")
+                definitionScope       = @($scope)
                 content               = $content
                 attributeScope        = "NODE_ROLE"
             } | ConvertTo-Json -Depth 8
 
-            if ($PSCmdlet.ShouldProcess($spec['fieldName'], "POST create device custom field ($($spec['attributeType']))")) {
+            if ($PSCmdlet.ShouldProcess($spec['fieldName'], "POST create $scopeWord ($($spec['attributeType']))")) {
                 $r = Invoke-NinjaApi -Method "POST" -Uri $attributesNodeUri -Body $createBody
                 if ($r.Code -lt 400) {
-                    Write-Host ("[OK {0}] created device custom field '{1}' ({2})" -f $r.Code, $spec['fieldName'], $spec['attributeType']) -ForegroundColor Green
+                    Write-Host ("[OK {0}] created {1} '{2}' ({3})" -f $r.Code, $scopeWord, $spec['fieldName'], $spec['attributeType']) -ForegroundColor Green
                     $customFieldsCreated++
-                    $customFieldNames.Add(("{0} ({1})" -f $spec['fieldName'], $spec['attributeType']))
+                    $customFieldNames.Add(("{0} ({1}, {2})" -f $spec['fieldName'], $spec['attributeType'], $scope))
                 }
                 else {
                     Write-Host ("[ERROR {0}] '{1}' - {2}" -f $r.Code, $spec['fieldName'], $r.Body) -ForegroundColor Red
@@ -1725,7 +1857,266 @@ if ($hasModuleSelection -and ($cleanModules -contains "dex")) {
                 }
             }
             else {
-                Write-Host ("[WhatIf] POST create device custom field '{0}' ({1})" -f $spec['fieldName'], $spec['attributeType'])
+                Write-Host ("[WhatIf] POST create {0} '{1}' ({2})" -f $scopeWord, $spec['fieldName'], $spec['attributeType'])
+            }
+        }
+    }
+    Write-Host ""
+}
+
+# =============================================================================
+# Pass 7: import the DEX Survey scripts into the tenant script library
+#         (only when -Modules includes "dex")
+# =============================================================================
+# The three DEX Survey scripts live in the NinjaOne global template library (read-only,
+# shared across tenants). To schedule them in a policy they must first be copied into the
+# tenant's OWN Automation library. For each template script we GET its full definition
+# (code + scriptVariables + uid), then POST it to the tenant library, carrying
+# sourceGlobalScriptUid so NinjaOne records the template it came from. Idempotent: a tenant
+# script already linked to the same template (sourceGlobalScriptUid) or sharing its name is
+# reused, not re-imported. The resulting numeric tenant script ids feed Pass 8.
+#   GET  /swb/s6/global-scripting/scripts        (template library list - resolve by name)
+#   GET  /swb/s6/global-scripting/scripts/{id}   (full template definition)
+#   GET  /swb/s6/scripting/scripts               (tenant library - idempotency)
+#   POST /swb/s6/scripting/scripts               (import one script)
+$dexImportedScripts = [ordered]@{}   # template-name -> @{ id; name; runAs; scriptVariables }
+if ($hasModuleSelection -and ($cleanModules -contains "dex")) {
+    Write-Host "== DEX Survey scripts (import into tenant library) =="
+
+    # The three template scripts, in run order, with the account each should run under in
+    # the scheduled automation (Pass 8). runAs: "loggedonuser" = Current Logged-on User
+    # (Script 1 prompts the user interactively); "system" = SYSTEM (Scripts 2 and 3 run
+    # unattended). The import itself always lands defaultRunAs = system (verified value); the
+    # per-script run context is set on the automation, not the library copy.
+    $dexScriptSpecs = @(
+        [ordered]@{ name = "DEX Survey - Script 1 - Request User Feedback";   runAs = "loggedonuser" }
+        [ordered]@{ name = "DEX Survey - Script 2 - Collect User Feedback";    runAs = "system" }
+        [ordered]@{ name = "DEX Survey - Script 3 - System Performance Check"; runAs = "system" }
+    )
+
+    $tmplResp   = Invoke-NinjaApi -Method "GET" -Uri $globalScriptsUri
+    $tenantResp = Invoke-NinjaApi -Method "GET" -Uri $scriptsUri
+    if ($tmplResp.Code -ge 400) {
+        Write-Host ("[ERROR {0}] could not list the template library - {1}" -f $tmplResp.Code, $tmplResp.Body) -ForegroundColor Red
+        $failed++
+    }
+    elseif ($tenantResp.Code -ge 400) {
+        Write-Host ("[ERROR {0}] could not list the tenant script library - {1}" -f $tenantResp.Code, $tenantResp.Body) -ForegroundColor Red
+        $failed++
+    }
+    else {
+        $tmplScripts   = @($tmplResp.Body | ConvertFrom-Json)
+        $tenantScripts = @($tenantResp.Body | ConvertFrom-Json)
+
+        foreach ($spec in $dexScriptSpecs) {
+            $tmpl = $tmplScripts | Where-Object { $_.name -eq $spec['name'] } | Select-Object -First 1
+            if (-not $tmpl) {
+                Write-Host ("[WARN] template script '{0}' not found in the library - skipping." -f $spec['name']) -ForegroundColor Yellow
+                continue
+            }
+            $tmplUid = if ($tmpl.PSObject.Properties['uid'] -and $tmpl.uid) { [string]$tmpl.uid } else { "" }
+
+            # Load the full template definition (code + scriptVariables); needed both to
+            # import and to wire the variables in Pass 8.
+            $detailResp = Invoke-NinjaApi -Method "GET" -Uri ("{0}/{1}" -f $globalScriptsUri, $tmpl.id)
+            if ($detailResp.Code -ge 400) {
+                Write-Host ("[ERROR {0}] could not load template '{1}' (id {2}) - {3}" -f $detailResp.Code, $spec['name'], $tmpl.id, $detailResp.Body) -ForegroundColor Red
+                $failed++
+                continue
+            }
+            $detail    = $detailResp.Body | ConvertFrom-Json
+            $tmplVars  = if ($detail.PSObject.Properties['scriptVariables'] -and $detail.scriptVariables) { @($detail.scriptVariables) } else { @() }
+
+            # Idempotency: reuse a tenant script already imported from this template
+            # (sourceGlobalScriptUid match) or sharing its exact name.
+            $existing = $tenantScripts | Where-Object {
+                ($_.PSObject.Properties['sourceGlobalScriptUid'] -and $_.sourceGlobalScriptUid -and ([string]$_.sourceGlobalScriptUid -eq $tmplUid)) -or
+                ($_.name -eq $spec['name'])
+            } | Select-Object -First 1
+
+            if ($existing) {
+                Write-Host ("[skip] '{0}' already in the tenant library (id {1})" -f $spec['name'], $existing.id) -ForegroundColor DarkGray
+                $dexImportedScripts[$spec['name']] = [ordered]@{ id = [int]$existing.id; name = $spec['name']; runAs = $spec['runAs']; scriptVariables = $tmplVars }
+                continue
+            }
+
+            # Build the import body (schema captured verbatim from the web UI's POST).
+            $importBody = [ordered]@{
+                architecture                      = @($detail.architecture)
+                categoriesIds                     = @($detail.categoriesIds)
+                code                              = [string]$detail.code
+                defaultRunAs                      = "system"
+                description                       = [string]$detail.description
+                language                          = [string]$detail.language
+                name                              = $spec['name']
+                operatingSystems                  = @($detail.operatingSystems)
+                scriptParameters                  = @()
+                scriptVariables                   = $tmplVars
+                sourceGlobalScriptUid             = $tmplUid
+                useFirstParametersOptionAsDefault = $false
+            } | ConvertTo-Json -Depth 20
+
+            if ($PSCmdlet.ShouldProcess($spec['name'], "POST import DEX script into tenant library")) {
+                $r = Invoke-NinjaApi -Method "POST" -Uri $scriptsUri -Body $importBody
+                if ($r.Code -lt 400) {
+                    $new   = $r.Body | ConvertFrom-Json
+                    $newId = if ($new.PSObject.Properties['id'] -and $new.id) { [int]$new.id } else { 0 }
+                    Write-Host ("[OK {0}] imported '{1}' (id {2})" -f $r.Code, $spec['name'], $newId) -ForegroundColor Green
+                    $scriptsImported++
+                    $scriptLibNames.Add(("{0} (id {1})" -f $spec['name'], $newId))
+                    $dexImportedScripts[$spec['name']] = [ordered]@{ id = $newId; name = $spec['name']; runAs = $spec['runAs']; scriptVariables = $tmplVars }
+                }
+                else {
+                    Write-Host ("[ERROR {0}] import '{1}' - {2}" -f $r.Code, $spec['name'], $r.Body) -ForegroundColor Red
+                    $failed++
+                }
+            }
+            else {
+                Write-Host ("[WhatIf] POST import DEX script '{0}' into tenant library" -f $spec['name'])
+                # Placeholder (id 0) so Pass 8 can still render its -WhatIf plan.
+                $dexImportedScripts[$spec['name']] = [ordered]@{ id = 0; name = $spec['name']; runAs = $spec['runAs']; scriptVariables = $tmplVars }
+            }
+        }
+    }
+    Write-Host ""
+}
+
+# =============================================================================
+# Pass 8: wire the DEX Survey scripts as a scheduled automation on the Windows
+#         Workstation default policy (only when -Modules includes "dex")
+# =============================================================================
+# "Weg B": the three imported scripts are scheduled as ONE ordered actionset ("DEX Survey")
+# on the Windows Workstation default policy - consistent with Pass 5, which adds the DEX
+# conditions to that same policy - so every workstation child policy inherits it. The three
+# scripts run in order (Request -> Collect -> Performance) weekly (Monday 10:00 local, so the
+# interactive Script 1 lands in working hours). Script 3's "WYSIWYG Custom Field Name" variable
+# is pointed at the global systemPerformanceReport field created in Pass 6. Scheduled automations
+# live in policy.content.actionsetSchedules (keyed by UUID); we GET the policy, splice in one
+# entry (idempotent on actionsetScheduleName), drop the read-only parentPolicyName, then PUT the
+# whole unwrapped policy back.
+#   GET /swb/s6/policy/{id}  ->  PUT /swb/s6/policy/{id}
+if ($hasModuleSelection -and ($cleanModules -contains "dex")) {
+    Write-Host "== DEX Survey scheduled automation (Windows Workstation default policy) =="
+
+    $automationName = "DEX Survey"
+    $perfFieldName  = "systemPerformanceReport"   # the global WYSIWYG field from Pass 6
+
+    # Weekly schedule - the object always carries every field; scheduleType selects which
+    # apply (weekDays for WEEKLY, dayOfMonth for MONTHLY, ...).
+    $dexSchedule = [ordered]@{
+        scheduleType   = "WEEKLY"
+        weekDays       = @("MON")
+        scheduleHour   = 10
+        scheduleMinute = 0
+        dayOfMonth     = 1
+        timeZone       = "_Local"
+    }
+
+    # The three scripts, in run order; all three are required to wire the actionset.
+    $orderedDexNames = @(
+        "DEX Survey - Script 1 - Request User Feedback"
+        "DEX Survey - Script 2 - Collect User Feedback"
+        "DEX Survey - Script 3 - System Performance Check"
+    )
+    $missingDex = @($orderedDexNames | Where-Object { -not $dexImportedScripts.Contains($_) })
+    if ($missingDex.Count -gt 0) {
+        Write-Host ("[WARN] not all DEX scripts are available ({0} missing) - skipping automation wiring." -f $missingDex.Count) -ForegroundColor Yellow
+    }
+    else {
+        $wsDefault = $allPolicies | Where-Object { $_.nodeClass -eq "WINDOWS_WORKSTATION" -and $_.nodeClassDefault -eq $true } | Select-Object -First 1
+        if (-not $wsDefault) {
+            Write-Host "[WARN] No default Windows Workstation policy found - skipping automation wiring." -ForegroundColor Yellow
+        }
+        else {
+            $getResp = Invoke-NinjaApi -Method "GET" -Uri ("{0}/{1}" -f $policyUri, $wsDefault.id)
+            if ($getResp.Code -ge 400) {
+                Write-Host ("[ERROR {0}] could not load policy '{1}' (id {2}) - {3}" -f $getResp.Code, $wsDefault.name, $wsDefault.id, $getResp.Body) -ForegroundColor Red
+                $failed++
+            }
+            else {
+                $policyWrap = $getResp.Body | ConvertFrom-Json -AsHashtable -Depth 100
+                $policy = $policyWrap.policy
+                if (-not $policy) {
+                    Write-Host ("[ERROR] policy payload missing for '{0}' (id {1})." -f $wsDefault.name, $wsDefault.id) -ForegroundColor Red
+                    $failed++
+                }
+                else {
+                    if (-not $policy.content)                    { $policy.content = [ordered]@{} }
+                    if (-not $policy.content.actionsetSchedules) { $policy.content.actionsetSchedules = [ordered]@{} }
+                    $schedules = $policy.content.actionsetSchedules
+
+                    # Idempotency: an entry already named "DEX Survey" means it is wired.
+                    $alreadyWired = $false
+                    foreach ($entry in $schedules.Values) {
+                        if ($entry['actionsetScheduleName'] -and ([string]$entry['actionsetScheduleName'] -eq $automationName)) { $alreadyWired = $true; break }
+                    }
+
+                    if ($alreadyWired) {
+                        Write-Host ("[OK] '{0}' already has the '{1}' scheduled automation." -f $policy.name, $automationName) -ForegroundColor DarkGray
+                    }
+                    else {
+                        # Build the ordered scripts array. Each carries its run context (runAs)
+                        # and its scriptVariables (value = template default), with Script 3's
+                        # "WYSIWYG Custom Field Name" pointed at the global report field.
+                        $scriptEntries = foreach ($nm in $orderedDexNames) {
+                            $imp  = $dexImportedScripts[$nm]
+                            $vars = @()
+                            foreach ($v in @($imp['scriptVariables'])) {
+                                $hasDefault = $v.PSObject.Properties['defaultValue'] -and ($null -ne $v.defaultValue)
+                                $val = if ($hasDefault) { [string]$v.defaultValue } else { "" }
+                                if ($v.name -eq "WYSIWYG Custom Field Name") { $val = $perfFieldName }
+                                $vars += [ordered]@{
+                                    name           = [string]$v.name
+                                    calculatedName = [string]$v.calculatedName
+                                    type           = [string]$v.type
+                                    value          = $val
+                                    source         = "LITERAL"
+                                    valueList      = @()
+                                    required       = [bool]$v.required
+                                    description    = if ($v.PSObject.Properties['description'] -and $v.description) { [string]$v.description } else { "" }
+                                    defaultValue   = if ($hasDefault) { [string]$v.defaultValue } else { $null }
+                                }
+                            }
+                            [ordered]@{
+                                scriptName      = "Run " + $nm
+                                scriptId        = [int]$imp['id']
+                                parameters      = [ordered]@{ runAs = [string]$imp['runAs']; scriptParam = "" }
+                                scriptVariables = @($vars)
+                            }
+                        }
+
+                        $schedules[[guid]::NewGuid().ToString()] = [ordered]@{
+                            enabled                      = $true
+                            actionsetScheduleName        = $automationName
+                            actionsetScheduleDescription = ""
+                            ticketingAction              = "NONE"
+                            notificationAction           = "NONE"
+                            ticketTemplateId             = $null
+                            inheritance                  = [ordered]@{ inherited = $false; overridden = $false; sourcePolicyId = $null }
+                            schedule                     = $dexSchedule
+                            scripts                      = @($scriptEntries)
+                        }
+
+                        if ($policy.Contains('parentPolicyName')) { [void]$policy.Remove('parentPolicyName') }
+                        $putBody = $policy | ConvertTo-Json -Depth 100
+
+                        if ($PSCmdlet.ShouldProcess($policy.name, "PUT wire '$automationName' scheduled automation (weekly, 3 scripts)")) {
+                            $r = Invoke-NinjaApi -Method "PUT" -Uri ("{0}/{1}" -f $policyUri, $wsDefault.id) -Body $putBody
+                            if ($r.Code -lt 400) {
+                                Write-Host ("[OK {0}] '{1}' <- '{2}' scheduled automation (3 scripts, weekly)" -f $r.Code, $policy.name, $automationName) -ForegroundColor Green
+                                $automationsWired++
+                                $automationNames.Add(("{0} -> {1}" -f $automationName, $policy.name))
+                            }
+                            else {
+                                Write-Host ("[ERROR {0}] '{1}' - {2}" -f $r.Code, $policy.name, $r.Body) -ForegroundColor Red
+                                $failed++
+                            }
+                        }
+                        else {
+                            Write-Host ("[WhatIf] PUT wire '{0}' scheduled automation on '{1}' (3 scripts, weekly)" -f $automationName, $policy.name)
+                        }
+                    }
+                }
             }
         }
     }
@@ -1910,15 +2301,26 @@ if ($moduleNames.Count -gt 0) {
     foreach ($n in $moduleNames) { Write-Host ("  - {0}" -f $n) }
 }
 if ($customFieldNames.Count -gt 0) {
-    Write-Host ("Created device custom fields ({0}):" -f $customFieldNames.Count)
+    Write-Host ("Created custom fields ({0}):" -f $customFieldNames.Count)
     foreach ($n in $customFieldNames) { Write-Host ("  - {0}" -f $n) }
+}
+if ($scriptLibNames.Count -gt 0) {
+    Write-Host ("Imported DEX Survey scripts ({0}):" -f $scriptLibNames.Count)
+    foreach ($n in $scriptLibNames) { Write-Host ("  - {0}" -f $n) }
+}
+if ($automationNames.Count -gt 0) {
+    Write-Host ("Wired scheduled automations ({0}):" -f $automationNames.Count)
+    foreach ($n in $automationNames) { Write-Host ("  - {0}" -f $n) }
+}
+if ($script:MfaElevated) {
+    Write-Host "MFA: session elevated via -MfaCode (step-up accepted)." -ForegroundColor Cyan
 }
 if ($rolesCreatedNames.Count -eq 0 -and $renamedNames.Count -eq 0 -and $createdNames.Count -eq 0 -and `
     $techCreatedNames.Count -eq 0 -and $techUpdatedNames.Count -eq 0 -and $moduleNames.Count -eq 0 -and `
-    $customFieldNames.Count -eq 0) {
+    $customFieldNames.Count -eq 0 -and $scriptLibNames.Count -eq 0 -and $automationNames.Count -eq 0) {
     Write-Host "Nothing changed - everything already matched the desired state."
 }
 Write-Host ""
-Write-Host ("Done. Node roles: {0}, Renamed: {1}, Child policies: {2}, Tech roles: +{3}/~{4}, Modules: +{5}, Custom fields: +{6}, Skipped: {7}, Failed: {8}" -f `
-    $rolesCreated, $renamed, $created, $techCreated, $techUpdated, $modulesApplied, $customFieldsCreated, $skipped, $failed)
+Write-Host ("Done. Node roles: {0}, Renamed: {1}, Child policies: {2}, Tech roles: +{3}/~{4}, Modules: +{5}, Custom fields: +{6}, Scripts: +{7}, Automations: +{8}, Skipped: {9}, Failed: {10}" -f `
+    $rolesCreated, $renamed, $created, $techCreated, $techUpdated, $modulesApplied, $customFieldsCreated, $scriptsImported, $automationsWired, $skipped, $failed)
 if ($failed -gt 0) { exit 1 }
