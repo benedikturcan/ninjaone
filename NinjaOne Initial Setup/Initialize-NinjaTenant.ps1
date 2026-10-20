@@ -1061,6 +1061,25 @@ function Invoke-NinjaApiRaw {
 # Tracks whether an MFA step-up has already succeeded this run (for the summary only).
 $script:MfaElevated = $false
 
+# The one-time TOTP currently available for a step-up. Seeded from -MfaCode; a TOTP is single-use,
+# so it is cleared after every step-up attempt (success or failure) and refilled interactively when
+# another challenge appears mid-run.
+$script:CurrentMfaCode = if ([string]::IsNullOrWhiteSpace($MfaCode)) { $null } else { $MfaCode.Trim() }
+
+# True only when stdin is an interactive console, i.e. the script may Read-Host a fresh code. In a
+# pipe/CI (input redirected) prompting would hang, so we fail fast with guidance instead.
+function Test-NinjaCanPrompt {
+    try { if ([System.Console]::IsInputRedirected) { return $false } } catch { return $false }
+    return $true
+}
+
+# Ask the operator for a fresh TOTP. Returns $null (never blocks) when input is non-interactive.
+function Get-NinjaMfaCode {
+    param([string] $Prompt)
+    if (-not (Test-NinjaCanPrompt)) { return $null }
+    try { return (Read-Host -Prompt $Prompt) } catch { return $null }
+}
+
 # Sends one request and transparently handles NinjaOne's MFA step-up. Privileged writes
 # answer HTTP 406 with a body like
 #   { "resultCode":"MFA_REQUIRED", "loginToken":"<uuid>", "mfaType":"TOTP", ... }
@@ -1076,52 +1095,74 @@ function Invoke-NinjaApi {
         [string] $Body
     )
     $resp = Invoke-NinjaApiRaw -Method $Method -Uri $Uri -Body $Body
+    if ($resp.Code -ne 406) { return $resp }
 
-    if ($resp.Code -ne 406 -or [string]::IsNullOrWhiteSpace($MfaCode)) {
-        return $resp
-    }
+    # A 406 may be NinjaOne's MFA step-up challenge. The session elevation that a step-up grants is
+    # time-windowed, so a long run can be challenged more than once - and a TOTP is single-use, so a
+    # single supplied code cannot answer every challenge. Loop: elevate with the code we currently
+    # hold; whenever that code is spent/expired, ask the operator for a fresh one (interactive) and
+    # retry against a brand-new loginToken. In a non-interactive shell we stop with guidance instead.
+    while ($true) {
+        $mfa = $null
+        try { $mfa = $resp.Body | ConvertFrom-Json } catch { }
+        $isMfa = $mfa -and $mfa.PSObject.Properties['resultCode'] -and $mfa.resultCode -eq 'MFA_REQUIRED'
+        if (-not $isMfa) { return $resp }
 
-    $mfa = $null
-    try { $mfa = $resp.Body | ConvertFrom-Json } catch { }
-    $isMfa = $mfa -and $mfa.PSObject.Properties['resultCode'] -and $mfa.resultCode -eq 'MFA_REQUIRED'
-    if (-not $isMfa) { return $resp }
+        $loginToken = if ($mfa.PSObject.Properties['loginToken']) { [string]$mfa.loginToken } else { $null }
 
-    $loginToken = if ($mfa.PSObject.Properties['loginToken']) { [string]$mfa.loginToken } else { $null }
-
-    # Merge the current body (an object) with loginToken + mfaCode. -AsHashtable keeps the
-    # nested structure intact; booleans/nulls/numbers round-trip through ConvertTo-Json.
-    $payload = [ordered]@{}
-    if (-not [string]::IsNullOrEmpty($Body)) {
-        $parsed = $Body | ConvertFrom-Json -AsHashtable
-        if ($parsed -is [System.Collections.IDictionary]) {
-            foreach ($k in $parsed.Keys) { $payload[$k] = $parsed[$k] }
+        $code = $script:CurrentMfaCode
+        if ([string]::IsNullOrWhiteSpace($code)) {
+            $code = Get-NinjaMfaCode -Prompt "MFA required - enter a fresh TOTP code to continue (blank to abort)"
+            if ([string]::IsNullOrWhiteSpace($code)) {
+                if (-not (Test-NinjaCanPrompt)) {
+                    throw ("MFA step-up required but no code is available and stdin is not interactive. " +
+                        "Pass a fresh -MFA/-MfaCode generated immediately before the run, or run in an " +
+                        "interactive terminal so the script can prompt for a fresh code when challenged.")
+                }
+                return $resp
+            }
         }
+        $code = $code.Trim()
+
+        # Merge the current body (an object) with loginToken + mfaCode. -AsHashtable keeps the nested
+        # structure intact; booleans/nulls/numbers round-trip through ConvertTo-Json. The body carries
+        # the full model (plus loginToken/mfaCode) exactly as the UI sends it, but NinjaOne reads the
+        # step-up credentials from the QUERY STRING (token, mfacode) - captured from the UI's own
+        # request: PUT {url}/mfa?token=<loginToken>&mfacode=<TOTP>.
+        $payload = [ordered]@{}
+        if (-not [string]::IsNullOrEmpty($Body)) {
+            $parsed = $Body | ConvertFrom-Json -AsHashtable
+            if ($parsed -is [System.Collections.IDictionary]) {
+                foreach ($k in $parsed.Keys) { $payload[$k] = $parsed[$k] }
+            }
+        }
+        $payload['loginToken'] = $loginToken
+        $payload['mfaCode']    = $code
+        $mfaBody = $payload | ConvertTo-Json -Depth 100 -Compress
+        $qs      = "token={0}&mfacode={1}" -f [System.Uri]::EscapeDataString([string]$loginToken), [System.Uri]::EscapeDataString($code)
+        $mfaUri  = ($Uri -replace '/+$', '') + '/mfa?' + $qs
+
+        $elevated = Invoke-NinjaApiRaw -Method $Method -Uri $mfaUri -Body $mfaBody
+        # A TOTP is single-use: whether it worked or not, never reuse it for the next challenge.
+        $script:CurrentMfaCode = $null
+        if ($elevated.Code -lt 400) {
+            $script:MfaElevated = $true
+            return $elevated
+        }
+
+        # Code rejected (expired/used/wrong). If we cannot ask for another one, stop with guidance.
+        if (-not (Test-NinjaCanPrompt)) {
+            throw ("MFA step-up rejected (HTTP $($elevated.Code)). The one-time code was expired, " +
+                "already used, or wrong, and stdin is not interactive so no fresh code can be " +
+                "requested. TOTP codes live ~30s and are single-use: generate a fresh code " +
+                "immediately before the run, or run in an interactive terminal so the script can " +
+                "prompt for a fresh code when challenged.")
+        }
+        Write-Host "MFA code rejected (HTTP $($elevated.Code)) - it was expired or already used. Enter a fresh one." -ForegroundColor Yellow
+        # Re-trigger the original request to obtain a brand-new loginToken for the next attempt.
+        $resp = Invoke-NinjaApiRaw -Method $Method -Uri $Uri -Body $Body
+        if ($resp.Code -ne 406) { return $resp }
     }
-    $code = ($MfaCode).Trim()
-    $payload['loginToken'] = $loginToken
-    $payload['mfaCode']    = $code
-
-    $mfaBody = $payload | ConvertTo-Json -Depth 100 -Compress
-    # NinjaOne reads the step-up credentials from the QUERY STRING (token, mfacode), not the
-    # body - captured from the web UI's own request: PUT {url}/mfa?token=<loginToken>&mfacode=<TOTP>.
-    # The body still carries the full model (plus loginToken/mfaCode) exactly as the UI sends it.
-    $qs      = "token={0}&mfacode={1}" -f [System.Uri]::EscapeDataString([string]$loginToken), [System.Uri]::EscapeDataString($code)
-    $mfaUri  = ($Uri -replace '/+$', '') + '/mfa?' + $qs
-
-    $elevated = Invoke-NinjaApiRaw -Method $Method -Uri $mfaUri -Body $mfaBody
-    if ($elevated.Code -lt 400) {
-        $script:MfaElevated = $true
-        return $elevated
-    }
-
-    # Step-up rejected. A TOTP is single-use and valid only ~30s, so once it is refused every
-    # later gated write refuses the same code identically. Stop the whole run now with an
-    # actionable message instead of emitting a cascade of indistinguishable 406s.
-    throw ("MFA step-up rejected (HTTP $($elevated.Code)). The one-time code passed via " +
-        "-MFA/-MfaCode was expired, already used, or wrong. TOTP codes live ~30s and are " +
-        "single-use: generate a fresh code immediately before running and re-run. Elevation is " +
-        "session-wide, so you can also perform any MFA-gated save in the NinjaOne UI first and " +
-        "then run without -MFA.")
 }
 
 # Prime the MFA step-up up front. A single successful step-up elevates the whole session
@@ -1134,7 +1175,9 @@ function Invoke-NinjaApi {
 # code is rejected). If the session is already elevated the no-op simply returns 200. Only runs
 # when a code was supplied; if the policy list cannot be loaded it silently defers to the lazy path.
 function Enter-NinjaMfaElevation {
-    if ([string]::IsNullOrWhiteSpace($MfaCode)) { return }
+    # Front-load the single step-up whenever we have a code or can prompt for one. Nothing to do if
+    # no code was supplied and we also cannot ask for one interactively (the lazy path handles it).
+    if ([string]::IsNullOrWhiteSpace($script:CurrentMfaCode) -and -not (Test-NinjaCanPrompt)) { return }
 
     $listResp = Invoke-NinjaApiRaw -Method "GET" -Uri $policyListUri
     if ($listResp.Code -ge 400) { return }
