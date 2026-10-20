@@ -1097,15 +1097,65 @@ function Invoke-NinjaApi {
             foreach ($k in $parsed.Keys) { $payload[$k] = $parsed[$k] }
         }
     }
+    $code = ($MfaCode).Trim()
     $payload['loginToken'] = $loginToken
-    $payload['mfaCode']    = ($MfaCode).Trim()
+    $payload['mfaCode']    = $code
 
     $mfaBody = $payload | ConvertTo-Json -Depth 100 -Compress
-    $mfaUri  = ($Uri -replace '/+$', '') + '/mfa'
+    # NinjaOne reads the step-up credentials from the QUERY STRING (token, mfacode), not the
+    # body - captured from the web UI's own request: PUT {url}/mfa?token=<loginToken>&mfacode=<TOTP>.
+    # The body still carries the full model (plus loginToken/mfaCode) exactly as the UI sends it.
+    $qs      = "token={0}&mfacode={1}" -f [System.Uri]::EscapeDataString([string]$loginToken), [System.Uri]::EscapeDataString($code)
+    $mfaUri  = ($Uri -replace '/+$', '') + '/mfa?' + $qs
 
     $elevated = Invoke-NinjaApiRaw -Method $Method -Uri $mfaUri -Body $mfaBody
-    if ($elevated.Code -lt 400) { $script:MfaElevated = $true }
-    return $elevated
+    if ($elevated.Code -lt 400) {
+        $script:MfaElevated = $true
+        return $elevated
+    }
+
+    # Step-up rejected. A TOTP is single-use and valid only ~30s, so once it is refused every
+    # later gated write refuses the same code identically. Stop the whole run now with an
+    # actionable message instead of emitting a cascade of indistinguishable 406s.
+    throw ("MFA step-up rejected (HTTP $($elevated.Code)). The one-time code passed via " +
+        "-MFA/-MfaCode was expired, already used, or wrong. TOTP codes live ~30s and are " +
+        "single-use: generate a fresh code immediately before running and re-run. Elevation is " +
+        "session-wide, so you can also perform any MFA-gated save in the NinjaOne UI first and " +
+        "then run without -MFA.")
+}
+
+# Prime the MFA step-up up front. A single successful step-up elevates the whole session
+# server-side (bound to the sessionKey), so every later gated write then returns < 400. Doing
+# that step-up lazily - only on the first gated write in Pass 5 - forces the one-time TOTP to
+# survive the ~25 preceding setup calls (node roles, renames, child policies) and it often
+# expires first. Instead we spend the fresh code immediately: a no-op policy PUT (re-sends the
+# model unchanged, so changedSections stays empty and nothing is persisted) answers 406 while
+# un-elevated, and Invoke-NinjaApi performs the step-up on the spot (throwing fail-fast if the
+# code is rejected). If the session is already elevated the no-op simply returns 200. Only runs
+# when a code was supplied; if the policy list cannot be loaded it silently defers to the lazy path.
+function Enter-NinjaMfaElevation {
+    if ([string]::IsNullOrWhiteSpace($MfaCode)) { return }
+
+    $listResp = Invoke-NinjaApiRaw -Method "GET" -Uri $policyListUri
+    if ($listResp.Code -ge 400) { return }
+    $policies = $null
+    try { $policies = $listResp.Body | ConvertFrom-Json } catch { }
+    $target = @($policies) | Where-Object { $_.id } | Select-Object -First 1
+    if (-not $target) { return }
+
+    $getResp = Invoke-NinjaApiRaw -Method "GET" -Uri ("{0}/{1}" -f $policyUri, $target.id)
+    if ($getResp.Code -ge 400) { return }
+    $pol = $null
+    try { $pol = ($getResp.Body | ConvertFrom-Json).policy } catch { }
+    if (-not $pol) { return }
+    if ($pol.PSObject.Properties['parentPolicyName']) { $pol.PSObject.Properties.Remove('parentPolicyName') }
+    $body = $pol | ConvertTo-Json -Depth 100
+
+    [void](Invoke-NinjaApi -Method "PUT" -Uri ("{0}/{1}" -f $policyUri, $target.id) -Body $body)
+    if ($script:MfaElevated) {
+        Write-Host "MFA: session elevated up front via -MfaCode (step-up accepted)." -ForegroundColor Cyan
+        Write-Host ""
+    }
 }
 
 # Build one fully-formed monitoring condition in the shape NinjaOne persists inside
@@ -1218,6 +1268,10 @@ if (-not $hasRoleSelection -and -not $hasPolicySelection -and -not $hasTechSelec
     Write-Host "No selection - enforcing the policy naming convention only."
 }
 Write-Host ""
+
+# Elevate the session now, while the supplied TOTP is still fresh, so gated writes later in the
+# run never have to race the code's ~30s lifetime.
+Enter-NinjaMfaElevation
 
 # --- Counters & result lists --------------------------------------------------
 $rolesCreated = 0
